@@ -4,6 +4,10 @@ project(MonoXRLayer LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Link the MSVC runtime statically so the layer DLL loads on machines without
+# the VC++ redistributable installed (the DLL is shipped standalone in app zips).
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+
 # Layer output name follows the OpenXR convention XR_APILAYER_<VENDOR>_<name>.
 set(LAYER_NAME "XR_APILAYER_NOVELTY_monoxr")
 
