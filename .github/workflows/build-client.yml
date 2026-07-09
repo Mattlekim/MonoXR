@@ -7,13 +7,17 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Needed by softprops/action-gh-release to create the release.
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-dotnet@v4
+      - uses: actions/setup-dotnet@v5
         with:
           dotnet-version: 8.0.x
 
@@ -29,7 +33,7 @@ jobs:
         run: Remove-Item artifacts/MonoXR.Client/MonoGame.Framework*.dll, artifacts/MonoXR.Client/SharpDX*.dll -ErrorAction SilentlyContinue
 
       - name: Upload DLLs
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: MonoXR.Client
           path: artifacts/MonoXR.Client
