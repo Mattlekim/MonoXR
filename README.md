@@ -61,8 +61,8 @@ the (largely unsupported) `XR_EXTX_overlay` extension.
 |---|---|
 | `shared/monoxr_abi.h` / `MonoXrAbi.cs` | The cross-process ABI (keep in sync) |
 | `layer/` | Native C++ OpenXR API layer (CMake) → `XR_APILAYER_NOVELTY_monoxr.dll` + `MonoXR.json` |
-| `client/` | `MonoXR.Client` — C# library: `MonoGameOverlayHost` (high level), `OverlayManager`/`Overlay` (low level), `MonoGameInterop` |
-| `sample/` | `MonoXR.Sample` — console app publishing a multi-panel overlay via `MonoGameOverlayHost` |
+| `client/` | `MonoXR.Client` — C# library: `MonoGameOverlayHost` (high level), `OverlayManager`/`Overlay` (low level), `MonoGameInterop`, in-VR UI controls (`Controles/`) |
+| `sample/` | `MonoXR.Sample` — console app publishing a multi-panel overlay via `MonoGameOverlayHost`, incl. a settings panel using the controls |
 
 ## Build
 
@@ -178,6 +178,48 @@ What the host does for you:
   adjust the quad in VR at any time (call `Invalidate()` after direct
   `Overlay` pose changes).
 
+## UI controls
+
+`client/Controles/` has a small set of ready-made widgets for building
+settings-style panels inside an `OverlayRenderTarget`, styled like a dark WPF
+settings window:
+
+| Control | What |
+|---|---|
+| `MonoXRMenuControl` | Vertical list of controls with one selected item; wraps and skips disabled items |
+| `MonoXRSliderControl` | Min/max/step slider with a value bar, thumb, and numeric readout; `ValueChanged` event |
+| `MonoXRCheckbox` | WPF-style checkbox (optional three-state) with `Checked`/`Unchecked`/`Click` events |
+| `MonoXRLabel` | Section header with a divider line; never a navigation target |
+| `MonoXRGroupBox` | Border + header around a single content control (typically a menu) |
+
+Controls are lightweight: they don't own a `SpriteBatch`, font, or textures —
+your panel passes its own to `Draw(spriteBatch, font, white)` inside its normal
+`Render` pass, and coordinates are local to the panel. Since overlays have no
+mouse focus in VR, input is action-based: route Up/Down/Increase/Decrease from
+wherever you detect it (global hotkey, gamepad, console key) through the static
+`OverlayNavigation.Raise(...)`, and let the menu handle it:
+
+```csharp
+var menu = new MonoXRMenuControl();
+menu.Add(new MonoXRLabel("Demo settings"));
+menu.Add(new MonoXRSliderControl("Volume", 0f, 100f, 60f, step: 5f));
+menu.Add(new MonoXRCheckbox("Show pulse panel", isChecked: true));
+var group = new MonoXRGroupBox("Settings", menu);
+
+OverlayNavigation.Navigated += a => { menu.HandleNavigation(a); Invalidate(); };
+
+// in the panel's Update:  group.Bounds = ...; group.Update(gameTime);
+// in the panel's Render:  _sb.Begin(); group.Draw(_sb, font, white); _sb.End();
+```
+
+Up/Down move the selection; Increase/Decrease go to the selected control — a
+slider steps by `Step`, a checkbox toggles. Remember to `Invalidate()` the
+hosting panel on navigation so the host re-renders it.
+
+Text needs a `SpriteFont`. If your app has no MonoGame content pipeline, see
+`sample/RuntimeFont.cs` — it builds one at runtime by rasterizing ASCII glyphs
+with GDI+. A complete panel using the controls is in `sample/SettingsPanel.cs`.
+
 ## Use it: low-level API
 
 For full control — e.g. several independent quads, head-locked overlays, or a
@@ -210,11 +252,14 @@ this for you).
 
 1. `./build-layer.ps1` then `./install-layer.ps1`.
 2. Run the sample: `dotnet run --project sample -c Release`. It publishes a
-   1024×1024 overlay with two panels and logs attach/detach; this already
+   1024×1024 overlay with three panels and logs attach/detach; this already
    validates the client, shared textures, and control block with no headset.
 3. Start any D3D11 OpenXR app / game. The overlay canvas should appear 2.5 m in
-   front of you — an animated panel plus a color-cycling panel. Press `E` in the
-   sample's console to toggle edit mode and drag panels with the mouse.
+   front of you — an animated panel, a color-cycling panel, and a settings panel
+   built from the UI controls. In the sample's console, press `E` to toggle edit
+   mode (drag panels with the mouse) and use the arrow keys to navigate the
+   settings panel: Up/Down select, Left/Right adjust (the checkbox shows/hides
+   the pulse panel).
 4. Layer logs: `%TEMP%\MonoXR\layer.log`.
 
 ## Limitations / notes
