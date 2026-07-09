@@ -8,59 +8,7 @@ using XnaColor = Microsoft.Xna.Framework.Color;
 
 namespace MonoXR.Client
 {
-    /// <summary>
-    /// One MonoGame render target placed somewhere on the overlay canvas.
-    /// Inherit from this and override <see cref="Update"/> (game logic) and
-    /// <see cref="Render"/> (drawing, target already bound). Move it at runtime
-    /// by changing <see cref="X"/>/<see cref="Y"/>.
-    /// </summary>
-    public abstract class OverlayRenderTarget : IDisposable
-    {
-        public RenderTarget2D Target { get; }
-
-        /// <summary>Shared device for creating textures, SpriteBatches, fonts, etc.</summary>
-        public GraphicsDevice GraphicsDevice { get; }
-
-        public int Width => Target.Width;
-        public int Height => Target.Height;
-
-        private int _x, _y;
-        private bool _visible = true;
-
-        /// <summary>Pixel location of this target's top-left corner in the overlay canvas.</summary>
-        public int X { get => _x; set { if (_x != value) { _x = value; Invalidate(); } } }
-        public int Y { get => _y; set { if (_y != value) { _y = value; Invalidate(); } } }
-
-        public bool Visible { get => _visible; set { if (_visible != value) { _visible = value; Invalidate(); } } }
-
-        /// <summary>
-        /// True when this target needs re-rendering and the canvas re-publishing.
-        /// Starts true so the first frame always draws. The host clears it after
-        /// rendering; call <see cref="Invalidate"/> whenever your content changes.
-        /// </summary>
-        public bool IsDirty { get; private set; } = true;
-
-        /// <summary>Mark this target as changed so the next frame re-renders and publishes it.</summary>
-        public void Invalidate() => IsDirty = true;
-
-        internal void ClearDirty() => IsDirty = false;
-
-        protected OverlayRenderTarget(GraphicsDevice device, int width, int height, int x, int y)
-        {
-            GraphicsDevice = device;
-            Target = new RenderTarget2D(device, width, height);
-            X = x;
-            Y = y;
-        }
-
-        /// <summary>Called once per frame, before any target renders. Put game/animation logic here.</summary>
-        public abstract void Update(GameTime gameTime);
-
-        /// <summary>Called once per frame with this render target already bound — just draw.</summary>
-        public abstract void Render(GameTime gameTime);
-
-        public virtual void Dispose() => Target.Dispose();
-    }
+ 
 
     /// <summary>
     /// Hosts a headless MonoGame GraphicsDevice inside a desktop app and publishes
@@ -172,9 +120,11 @@ namespace MonoXR.Client
         private const int SM_CXSCREEN = 0;
         private const int SM_CYSCREEN = 1;
         private const int VK_LBUTTON = 0x01;
+        private const int VK_RBUTTON = 0x02;
 
         private int _cursorX, _cursorY;
         private bool _lmbWasDown;
+        private bool _rmbWasDown;
         private OverlayRenderTarget? _dragTarget;
         private int _dragOffsetX, _dragOffsetY;
 
@@ -199,6 +149,7 @@ namespace MonoXR.Client
                     DragCompleted?.Invoke(done);
                 }
                 _lmbWasDown = false;
+                _rmbWasDown = false;
                 return;
             }
 
@@ -216,21 +167,17 @@ namespace MonoXR.Client
             }
 
             bool lmb = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+            bool rmb = (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
 
             if (lmb && !_lmbWasDown)
             {
-                // Press: pick the topmost (last-added) visible target under the cursor.
-                for (int i = _targets.Count - 1; i >= 0; i--)
+                // Press: pick the topmost (last-added) visible target under the
+                // cursor. Collapsed targets only occupy their collapsed bar.
+                _dragTarget = HitTest(mx, my);
+                if (_dragTarget != null)
                 {
-                    var rt = _targets[i];
-                    if (!rt.Visible) continue;
-                    if (mx >= rt.X && mx < rt.X + rt.Width && my >= rt.Y && my < rt.Y + rt.Height)
-                    {
-                        _dragTarget = rt;
-                        _dragOffsetX = mx - rt.X;
-                        _dragOffsetY = my - rt.Y;
-                        break;
-                    }
+                    _dragOffsetX = mx - _dragTarget.X;
+                    _dragOffsetY = my - _dragTarget.Y;
                 }
             }
             else if (!lmb && _dragTarget != null)
@@ -242,11 +189,33 @@ namespace MonoXR.Client
 
             if (lmb && _dragTarget != null)
             {
-                _dragTarget.X = Math.Clamp(mx - _dragOffsetX, 0, Math.Max(0, CanvasWidth - _dragTarget.Width));
-                _dragTarget.Y = Math.Clamp(my - _dragOffsetY, 0, Math.Max(0, CanvasHeight - _dragTarget.Height));
+                _dragTarget.X = Math.Clamp(mx - _dragOffsetX, 0, Math.Max(0, CanvasWidth - _dragTarget.DisplayWidth));
+                _dragTarget.Y = Math.Clamp(my - _dragOffsetY, 0, Math.Max(0, CanvasHeight - _dragTarget.DisplayHeight));
+            }
+
+            // Right-click toggles a target between Visible and Collapsed.
+            if (rmb && !_rmbWasDown)
+            {
+                var hit = HitTest(mx, my);
+                if (hit != null)
+                    hit.State = hit.IsCollapsed ? OverlayTargetState.Visible : OverlayTargetState.Collapsed;
             }
 
             _lmbWasDown = lmb;
+            _rmbWasDown = rmb;
+        }
+
+        /// <summary>Topmost (last-added) shown target whose displayed bounds contain the point.</summary>
+        private OverlayRenderTarget? HitTest(int mx, int my)
+        {
+            for (int i = _targets.Count - 1; i >= 0; i--)
+            {
+                var rt = _targets[i];
+                if (!rt.Visible) continue;
+                if (mx >= rt.X && mx < rt.X + rt.DisplayWidth && my >= rt.Y && my < rt.Y + rt.DisplayHeight)
+                    return rt;
+            }
+            return null;
         }
 
         /// <summary>
@@ -396,7 +365,12 @@ namespace MonoXR.Client
             foreach (var rt in _targets)
             {
                 if (!rt.Visible) continue;
-                _compositor.Draw(rt.Target, new Microsoft.Xna.Framework.Vector2(rt.X, rt.Y), XnaColor.White);
+                // Collapsed targets only contribute their top-left name-bar
+                // region (the subclass draws the bar there when collapsed).
+                var src = new Microsoft.Xna.Framework.Rectangle(0, 0, rt.DisplayWidth, rt.DisplayHeight);
+                _compositor.Draw(rt.Target,
+                    new Microsoft.Xna.Framework.Rectangle(rt.X, rt.Y, rt.DisplayWidth, rt.DisplayHeight),
+                    src, XnaColor.White);
             }
             if (EditMode)
             {
@@ -412,11 +386,12 @@ namespace MonoXR.Client
                 foreach (var rt in _targets)
                 {
                     if (!rt.Visible) continue;
+                    int dw = rt.DisplayWidth, dh = rt.DisplayHeight;
                     var c = rt == _dragTarget ? XnaColor.Lime : XnaColor.Yellow;
-                    _compositor.Draw(_whitePixel, new Microsoft.Xna.Framework.Rectangle(rt.X, rt.Y, rt.Width, 2), c);
-                    _compositor.Draw(_whitePixel, new Microsoft.Xna.Framework.Rectangle(rt.X, rt.Y + rt.Height - 2, rt.Width, 2), c);
-                    _compositor.Draw(_whitePixel, new Microsoft.Xna.Framework.Rectangle(rt.X, rt.Y, 2, rt.Height), c);
-                    _compositor.Draw(_whitePixel, new Microsoft.Xna.Framework.Rectangle(rt.X + rt.Width - 2, rt.Y, 2, rt.Height), c);
+                    _compositor.Draw(_whitePixel, new Microsoft.Xna.Framework.Rectangle(rt.X, rt.Y, dw, 2), c);
+                    _compositor.Draw(_whitePixel, new Microsoft.Xna.Framework.Rectangle(rt.X, rt.Y + dh - 2, dw, 2), c);
+                    _compositor.Draw(_whitePixel, new Microsoft.Xna.Framework.Rectangle(rt.X, rt.Y, 2, dh), c);
+                    _compositor.Draw(_whitePixel, new Microsoft.Xna.Framework.Rectangle(rt.X + dw - 2, rt.Y, 2, dh), c);
                 }
 
                 // Crosshair cursor at the mapped mouse position, visible in VR.
