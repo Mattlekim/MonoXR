@@ -95,17 +95,6 @@ $env:XR_API_LAYER_PATH   = "$PWD\layer\build\Release"
 $env:XR_ENABLE_API_LAYERS = "XR_APILAYER_NOVELTY_monoxr"
 ```
 
-## Get the prebuilt DLL
-
-Every push to `master`/`main` builds `MonoXR.Client` on GitHub Actions
-(`.github/workflows/build-client.yml`) and uploads the compiled DLLs as a
-**`MonoXR.Client` artifact** — open the run under the repo's *Actions* tab and
-download it. Pushing a tag like `v1.0` additionally attaches
-`MonoXR.Client.zip` to a **GitHub Release**.
-
-The package contains `MonoXR.Client.dll` plus its Vortice/SharpGen dependency
-DLLs. It does **not** contain MonoGame — your project brings its own via NuGet.
-
 ### Use the DLL in your own project
 
 1. Your project must target **`net8.0-windows`, x64**, and reference
