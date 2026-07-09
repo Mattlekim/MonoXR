@@ -1,3 +1,21 @@
+# Visual Studio caches and user settings
+.vs/
+*.user
+*.suo
+
+# Build output
 bin/
 obj/
+x64/
+Debug/
+Release/
+out/
+
+# CMake build output
 layer/build/
+CMakeCache.txt
+CMakeFiles/
+
+# Misc
+*.log
+*.tmp
