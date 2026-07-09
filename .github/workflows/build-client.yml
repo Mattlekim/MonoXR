@@ -1,0 +1,47 @@
+name: Build MonoXR.Client
+
+on:
+  push:
+    branches: [ master, main ]
+    tags: [ 'v*' ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      # publish (not build) so the Vortice/SharpGen dependency DLLs are
+      # copied next to MonoXR.Client.dll.
+      - name: Build MonoXR.Client
+        run: dotnet publish client/MonoXR.Client.csproj -c Release -o artifacts/MonoXR.Client
+
+      # Consumers reference MonoGame from NuGet themselves; shipping our copy
+      # would just fight with theirs.
+      - name: Trim MonoGame from the package
+        shell: pwsh
+        run: Remove-Item artifacts/MonoXR.Client/MonoGame.Framework*.dll, artifacts/MonoXR.Client/SharpDX*.dll -ErrorAction SilentlyContinue
+
+      - name: Upload DLLs
+        uses: actions/upload-artifact@v4
+        with:
+          name: MonoXR.Client
+          path: artifacts/MonoXR.Client
+
+      # Pushing a tag like v1.0 also publishes the DLLs as a GitHub Release.
+      - name: Zip for release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: Compress-Archive -Path artifacts/MonoXR.Client/* -DestinationPath MonoXR.Client.zip
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: MonoXR.Client.zip
