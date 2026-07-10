@@ -71,8 +71,12 @@ namespace MonoXR.Client
         /// <summary>Draws the selection background used by all controls.</summary>
         protected void DrawSelectionBackground(SpriteBatch spriteBatch, Texture2D white)
         {
-            if (IsSelected)
-                spriteBatch.Draw(white, Bounds, SelectionFill);
+            if (!IsSelected) return;
+            // Rounded highlight with an accent bar on the left edge, like a
+            // modern list selection.
+            MonoXRDraw.RoundedRect(spriteBatch, Bounds, 10, SelectionFill);
+            MonoXRDraw.RoundedRect(spriteBatch,
+                new XnaRectangle(Bounds.X + 4, Bounds.Y + 8, 5, Bounds.Height - 16), 2, AccentSelected);
         }
     }
 }

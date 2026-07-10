@@ -73,35 +73,38 @@ namespace MonoXR.Client
         {
             DrawSelectionBackground(spriteBatch, white);
 
+            // Drawn as a modern toggle switch: a pill track with a sliding
+            // round knob — accent-filled when on, dim when off, knob centered
+            // for indeterminate.
             int pad = 12;
-            int boxSize = Math.Min(28, Bounds.Height - 8);
-            int boxX = Bounds.X + pad;
-            int boxY = Bounds.Y + (Bounds.Height - boxSize) / 2;
+            int swH = Math.Min(30, Bounds.Height - 8);
+            int swW = swH * 9 / 5;
+            int swX = Bounds.X + pad;
+            int swY = Bounds.Y + (Bounds.Height - swH) / 2;
 
-            // Box outline over a track-coloured fill.
-            spriteBatch.Draw(white, new XnaRectangle(boxX, boxY, boxSize, boxSize), TrackFill);
-            var edge = AccentColor;
-            spriteBatch.Draw(white, new XnaRectangle(boxX, boxY, boxSize, 2), edge);
-            spriteBatch.Draw(white, new XnaRectangle(boxX, boxY + boxSize - 2, boxSize, 2), edge);
-            spriteBatch.Draw(white, new XnaRectangle(boxX, boxY, 2, boxSize), edge);
-            spriteBatch.Draw(white, new XnaRectangle(boxX + boxSize - 2, boxY, 2, boxSize), edge);
+            var trackColor = _isChecked == true ? AccentColor : TrackFill;
+            MonoXRDraw.RoundedRect(spriteBatch, new XnaRectangle(swX, swY, swW, swH), swH / 2, trackColor);
+            if (_isChecked != true)
+                MonoXRDraw.RoundedRectOutline(spriteBatch, new XnaRectangle(swX, swY, swW, swH), swH / 2, 2,
+                                              IsEnabled ? Divider : DisabledText);
+            else if (IsSelected && IsEnabled)
+                MonoXRDraw.VerticalFade(spriteBatch, new XnaRectangle(swX + 2, swY + swH, swW - 4, 8),
+                                        AccentColor * 0.35f);
 
-            if (_isChecked == true)
+            int knobR = swH / 2 - 3;
+            int knobCx = _isChecked switch
             {
-                // Filled inner square as the check mark.
-                spriteBatch.Draw(white, new XnaRectangle(boxX + 6, boxY + 6, boxSize - 12, boxSize - 12),
-                                 AccentColor);
-            }
-            else if (_isChecked == null)
-            {
-                // Horizontal dash for indeterminate.
-                spriteBatch.Draw(white, new XnaRectangle(boxX + 6, boxY + boxSize / 2 - 2, boxSize - 12, 4),
-                                 AccentColor);
-            }
+                true => swX + swW - knobR - 4,
+                false => swX + knobR + 4,
+                null => swX + swW / 2,
+            };
+            spriteBatch.Draw(MonoXRDraw.Circle(spriteBatch.GraphicsDevice, knobR),
+                new XnaRectangle(knobCx - knobR, swY + swH / 2 - knobR, knobR * 2, knobR * 2),
+                IsEnabled ? XnaColor.White : NormalText);
 
             int textY = Bounds.Y + (Bounds.Height - font.LineSpacing) / 2;
             spriteBatch.DrawString(font, Content,
-                                   new XnaVector2(boxX + boxSize + pad, textY), TextColor);
+                                   new XnaVector2(swX + swW + pad, textY), TextColor);
         }
     }
 }

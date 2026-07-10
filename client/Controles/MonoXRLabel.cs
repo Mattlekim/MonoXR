@@ -23,14 +23,20 @@ namespace MonoXR.Client
 
         public override void Draw(SpriteBatch spriteBatch, SpriteFont font, Texture2D white)
         {
-            int textY = Bounds.Y + (Bounds.Height - font.LineSpacing) / 2;
-            spriteBatch.DrawString(font, Text, new XnaVector2(Bounds.X, textY), SelectedText);
+            // Small rounded accent tick in front of the header text.
+            int tickH = font.LineSpacing - 12;
+            int tickY = Bounds.Y + (Bounds.Height - tickH) / 2;
+            MonoXRDraw.RoundedRect(spriteBatch, new XnaRectangle(Bounds.X, tickY, 5, tickH), 2, AccentSelected);
 
-            // Divider from the end of the text to the row's right edge.
-            int lineX = Bounds.X + (int)Math.Ceiling(font.MeasureString(Text).X) + 12;
+            int textX = Bounds.X + 14;
+            int textY = Bounds.Y + (Bounds.Height - font.LineSpacing) / 2;
+            spriteBatch.DrawString(font, Text, new XnaVector2(textX, textY), SelectedText);
+
+            // Divider fading out toward the row's right edge.
+            int lineX = textX + (int)Math.Ceiling(font.MeasureString(Text).X) + 12;
             int lineY = Bounds.Y + Bounds.Height / 2;
             if (lineX < Bounds.Right)
-                spriteBatch.Draw(white, new XnaRectangle(lineX, lineY, Bounds.Right - lineX, 2), Divider);
+                MonoXRDraw.HorizontalFade(spriteBatch, new XnaRectangle(lineX, lineY, Bounds.Right - lineX, 2), Divider);
         }
     }
 }

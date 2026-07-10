@@ -111,7 +111,18 @@ namespace MonoXR.Client
         public bool EditMode
         {
             get => _editMode;
-            set { if (_editMode != value) { _editMode = value; _canvasDirty = true; } }
+            set
+            {
+                if (_editMode == value) return;
+                _editMode = value;
+                _canvasDirty = true;
+                // Let targets react (e.g. draw a placeholder while edited).
+                foreach (var rt in _targets)
+                {
+                    rt.EditMode = value;
+                    rt.Invalidate();
+                }
+            }
         }
 
         /// <summary>Pixel thickness of the edit-mode border.</summary>
@@ -280,11 +291,13 @@ namespace MonoXR.Client
                 if (collapse.Contains(mx, my))
                 {
                     rt.State = rt.IsCollapsed ? OverlayTargetState.Visible : OverlayTargetState.Collapsed;
+                    _canvasDirty = true;
                     return true;
                 }
                 if (hide.Contains(mx, my))
                 {
                     rt.State = rt.Visible ? OverlayTargetState.Hidden : OverlayTargetState.Visible;
+                    _canvasDirty = true;
                     return true;
                 }
             }
@@ -356,6 +369,7 @@ namespace MonoXR.Client
         /// </summary>
         public T AddRenderTarget<T>(T renderTarget) where T : OverlayRenderTarget
         {
+            renderTarget.EditMode = _editMode;
             _targets.Add(renderTarget);
             return renderTarget;
         }
@@ -418,8 +432,14 @@ namespace MonoXR.Client
             var gameTime = new GameTime(total, total - _lastTotal);
             _lastTotal = total;
 
+            // Hidden targets are completely dormant outside edit mode: no
+            // Update, no Render, and their dirty flag can't wake the canvas.
+            // In edit mode they stay live so the 10% ghost reflects reality.
             foreach (var rt in _targets)
+            {
+                if (!rt.Visible && !EditMode) continue;
                 rt.Update(gameTime);
+            }
 
             // Dirty-flag rendering: when no target changed and nothing at the
             // canvas level changed (pose, edit mode, resolution), skip all GPU
@@ -427,7 +447,10 @@ namespace MonoXR.Client
             // frame for free. Heartbeat still runs so attach/detach tracking works.
             bool anyDirty = _canvasDirty;
             foreach (var rt in _targets)
+            {
+                if (!rt.Visible && !EditMode) continue;
                 anyDirty |= rt.IsDirty;
+            }
             if (!anyDirty)
             {
                 _mgr.Heartbeat();
@@ -435,10 +458,13 @@ namespace MonoXR.Client
             }
 
             // Only re-render targets that actually changed; clean targets keep
-            // their existing texture and are just re-composited.
+            // their existing texture and are just re-composited. A dormant
+            // hidden target keeps its dirty flag, so it re-renders as soon as
+            // it is shown (or edit mode exposes its ghost).
             foreach (var rt in _targets)
             {
                 if (!rt.IsDirty) continue;
+                if (!rt.Visible && !EditMode) continue;
                 GraphicsDevice.SetRenderTarget(rt.Target);
                 rt.Render(gameTime);
                 rt.ClearDirty();
@@ -557,12 +583,10 @@ namespace MonoXR.Client
         private void DrawEditButton(XnaRectangle r, string label, bool active)
         {
             var bg = active ? new XnaColor(90, 60, 140) : new XnaColor(40, 40, 60);
-            _compositor.Draw(_whitePixel, r, bg);
             var edge = active ? XnaColor.MediumPurple : XnaColor.Yellow;
-            _compositor.Draw(_whitePixel, new XnaRectangle(r.X, r.Y, r.Width, 2), edge);
-            _compositor.Draw(_whitePixel, new XnaRectangle(r.X, r.Bottom - 2, r.Width, 2), edge);
-            _compositor.Draw(_whitePixel, new XnaRectangle(r.X, r.Y, 2, r.Height), edge);
-            _compositor.Draw(_whitePixel, new XnaRectangle(r.Right - 2, r.Y, 2, r.Height), edge);
+            int radius = r.Height / 2;
+            MonoXRDraw.RoundedRect(_compositor, r, radius, bg);
+            MonoXRDraw.RoundedRectOutline(_compositor, r, radius, 2, edge);
 
             if (EditFont != null)
             {

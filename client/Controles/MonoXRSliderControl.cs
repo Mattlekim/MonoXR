@@ -73,29 +73,44 @@ namespace MonoXR.Client
             int textY = Bounds.Y + (Bounds.Height - font.LineSpacing) / 2;
             spriteBatch.DrawString(font, Name, new XnaVector2(Bounds.X + pad, textY), TextColor);
 
-            // Value bar occupies the right half, leaving room for the readout.
-            // Same anatomy as the WPF slider template: thin track, colored
-            // fill up to the value, white round-ish thumb with a dark stroke.
+            // Value bar occupies the right half, leaving room for the readout:
+            // a rounded pill track, colored fill with a soft glow underneath,
+            // and a circular thumb with a dark ring.
             string readout = _value.ToString(Format);
             int readoutW = (int)Math.Ceiling(font.MeasureString(readout).X);
             int barX = Bounds.X + Bounds.Width / 2;
             int barW = Bounds.X + Bounds.Width - barX - readoutW - pad * 2;
-            int barH = 6;
+            int barH = 8;
             int barY = Bounds.Y + (Bounds.Height - barH) / 2;
             if (barW > 0)
             {
                 float t = Math.Clamp((_value - Minimum) / (Maximum - Minimum), 0f, 1f);
                 var fill = !IsEnabled ? DisabledText : (FillColor ?? AccentColor);
-                spriteBatch.Draw(white, new XnaRectangle(barX, barY, barW, barH), TrackEmpty);
-                spriteBatch.Draw(white, new XnaRectangle(barX, barY, (int)(barW * t), barH), fill);
+                MonoXRDraw.RoundedRect(spriteBatch, new XnaRectangle(barX, barY, barW, barH), barH / 2, TrackEmpty);
+                int fillW = (int)(barW * t);
+                if (fillW >= barH)
+                {
+                    MonoXRDraw.RoundedRect(spriteBatch, new XnaRectangle(barX, barY, fillW, barH), barH / 2, fill);
+                    // Soft glow under the filled part, stronger when selected.
+                    MonoXRDraw.VerticalFade(spriteBatch,
+                        new XnaRectangle(barX + 2, barY + barH, fillW - 4, IsSelected ? 10 : 6),
+                        fill * (IsSelected ? 0.35f : 0.2f));
+                }
 
-                // Thumb centered on the value position, clamped to the track.
-                int thumbSize = 18;
-                int thumbX = Math.Clamp(barX + (int)(barW * t) - thumbSize / 2, barX, barX + barW - thumbSize);
-                int thumbY = Bounds.Y + (Bounds.Height - thumbSize) / 2;
-                spriteBatch.Draw(white, new XnaRectangle(thumbX, thumbY, thumbSize, thumbSize), ThumbStroke);
-                spriteBatch.Draw(white, new XnaRectangle(thumbX + 2, thumbY + 2, thumbSize - 4, thumbSize - 4),
-                                 IsEnabled ? ThumbFill : NormalText);
+                // Circular thumb centered on the value, clamped to the track.
+                int thumbR = 11;
+                int thumbCx = Math.Clamp(barX + fillW, barX + thumbR, barX + barW - thumbR);
+                int thumbCy = Bounds.Y + Bounds.Height / 2;
+                if (IsSelected && IsEnabled)
+                    spriteBatch.Draw(MonoXRDraw.Circle(spriteBatch.GraphicsDevice, thumbR + 5),
+                        new XnaRectangle(thumbCx - thumbR - 5, thumbCy - thumbR - 5, (thumbR + 5) * 2, (thumbR + 5) * 2),
+                        fill * 0.35f);
+                spriteBatch.Draw(MonoXRDraw.Circle(spriteBatch.GraphicsDevice, thumbR),
+                    new XnaRectangle(thumbCx - thumbR, thumbCy - thumbR, thumbR * 2, thumbR * 2), ThumbStroke);
+                int innerR = thumbR - 3;
+                spriteBatch.Draw(MonoXRDraw.Circle(spriteBatch.GraphicsDevice, innerR),
+                    new XnaRectangle(thumbCx - innerR, thumbCy - innerR, innerR * 2, innerR * 2),
+                    IsEnabled ? ThumbFill : NormalText);
             }
 
             spriteBatch.DrawString(font, readout,

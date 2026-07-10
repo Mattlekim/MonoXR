@@ -48,6 +48,13 @@ namespace MonoXR.Client
         /// </summary>
         public string Name { get; set; }
 
+        /// <summary>
+        /// True while the host is in edit mode. Set by the host (which also
+        /// invalidates the target on changes) so targets that are normally
+        /// invisible when idle can draw a placeholder to position them by.
+        /// </summary>
+        public bool EditMode { get; internal set; }
+
         /// <summary>Hidden / Visible / Collapsed. Changing it re-renders and republishes.</summary>
         public OverlayTargetState State
         {
