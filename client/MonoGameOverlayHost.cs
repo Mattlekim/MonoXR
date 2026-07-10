@@ -185,6 +185,7 @@ namespace MonoXR.Client
         private bool _lmbWasDown;
         private OverlayRenderTarget? _dragTarget;
         private int _dragOffsetX, _dragOffsetY;
+        private OverlayRenderTarget? _editCapture; // target that claimed the gesture via OnEditPress
 
         /// <summary>The render target currently being dragged in edit mode (null when none).</summary>
         public OverlayRenderTarget? DragTarget => _dragTarget;
@@ -205,6 +206,13 @@ namespace MonoXR.Client
                     var done = _dragTarget;
                     _dragTarget = null;
                     DragCompleted?.Invoke(done);
+                }
+                if (_editCapture != null)
+                {
+                    var cap = _editCapture;
+                    _editCapture = null;
+                    cap.OnEditRelease(_cursorX - cap.X, _cursorY - cap.Y);
+                    _canvasDirty = true;
                 }
                 _lmbWasDown = false;
                 return;
@@ -242,11 +250,20 @@ namespace MonoXR.Client
                 // Collapsed targets only occupy their collapsed bar.
                 if (!HandleEditButtonClick(mx, my))
                 {
-                    _dragTarget = HitTest(mx, my);
-                    if (_dragTarget != null)
+                    var hit = HitTest(mx, my);
+                    // The target gets first refusal (e.g. dragging an internal
+                    // element like a column header); otherwise the whole
+                    // target drags as before.
+                    if (hit != null && hit.OnEditPress(mx - hit.X, my - hit.Y))
                     {
-                        _dragOffsetX = mx - _dragTarget.X;
-                        _dragOffsetY = my - _dragTarget.Y;
+                        _editCapture = hit;
+                        _canvasDirty = true;
+                    }
+                    else if (hit != null)
+                    {
+                        _dragTarget = hit;
+                        _dragOffsetX = mx - hit.X;
+                        _dragOffsetY = my - hit.Y;
                     }
                 }
             }
@@ -256,11 +273,22 @@ namespace MonoXR.Client
                 _dragTarget = null;
                 DragCompleted?.Invoke(done);
             }
+            else if (!lmb && _editCapture != null)
+            {
+                var cap = _editCapture;
+                _editCapture = null;
+                cap.OnEditRelease(mx - cap.X, my - cap.Y);
+                _canvasDirty = true;
+            }
 
             if (lmb && _dragTarget != null)
             {
                 _dragTarget.X = Math.Clamp(mx - _dragOffsetX, 0, Math.Max(0, CanvasWidth - _dragTarget.DisplayWidth));
                 _dragTarget.Y = Math.Clamp(my - _dragOffsetY, 0, Math.Max(0, CanvasHeight - _dragTarget.DisplayHeight));
+            }
+            else if (lmb && _editCapture != null)
+            {
+                _editCapture.OnEditDrag(mx - _editCapture.X, my - _editCapture.Y);
             }
 
             _lmbWasDown = lmb;
@@ -471,12 +499,18 @@ namespace MonoXR.Client
             }
 
             // Compose on the GPU: transparent canvas, then each visible target
-            // drawn at (X, Y). Opaque blend writes the target's own alpha, so
-            // anywhere no target covers stays fully transparent in VR (the
-            // layer submits with BLEND_TEXTURE_SOURCE_ALPHA).
+            // drawn at (X, Y). Targets render with SpriteBatch's default
+            // (premultiplied) AlphaBlend onto a transparent clear, so the same
+            // blend here composites them correctly: a target's transparent
+            // pixels leave whatever is underneath intact (Opaque would punch
+            // holes through lower targets wherever rects overlap — rounded
+            // corners, or a target that hides by drawing nothing), uncovered
+            // canvas stays fully transparent in VR, and covered areas get the
+            // target's own alpha (the layer submits with
+            // BLEND_TEXTURE_SOURCE_ALPHA).
             GraphicsDevice.SetRenderTarget(_canvasTarget);
             GraphicsDevice.Clear(XnaColor.Transparent);
-            _compositor.Begin(SpriteSortMode.Deferred, BlendState.Opaque, SamplerState.PointClamp);
+            _compositor.Begin(SpriteSortMode.Deferred, BlendState.AlphaBlend, SamplerState.PointClamp);
             if (EditMode)
             {
                 // Hidden targets: drawn first (behind everything) as a 10%-

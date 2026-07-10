@@ -27,7 +27,7 @@ namespace MonoXR.Client
     /// </summary>
     public abstract class OverlayRenderTarget : IDisposable
     {
-        public RenderTarget2D Target { get; }
+        public RenderTarget2D Target { get; private set; }
 
         /// <summary>Shared device for creating textures, SpriteBatches, fonts, etc.</summary>
         public GraphicsDevice GraphicsDevice { get; }
@@ -100,6 +100,19 @@ namespace MonoXR.Client
         /// <summary>Mark this target as changed so the next frame re-renders and publishes it.</summary>
         public void Invalidate() => IsDirty = true;
 
+        /// <summary>
+        /// Recreate the backing texture at a new size (e.g. a user resize in
+        /// edit mode). Contents are lost; the target re-renders next frame.
+        /// Call only from the render thread (edit-input callbacks are).
+        /// </summary>
+        protected void Resize(int width, int height)
+        {
+            if (width == Target.Width && height == Target.Height) return;
+            Target.Dispose();
+            Target = new RenderTarget2D(GraphicsDevice, Math.Max(1, width), Math.Max(1, height));
+            Invalidate();
+        }
+
         internal void ClearDirty() => IsDirty = false;
 
         protected OverlayRenderTarget(GraphicsDevice device, int width, int height, int x, int y)
@@ -110,6 +123,20 @@ namespace MonoXR.Client
             Y = y;
             Name = GetType().Name;
         }
+
+        /// <summary>
+        /// Edit-mode pointer press inside this target, in target-local pixels.
+        /// Return true to capture the gesture: the host then routes
+        /// <see cref="OnEditDrag"/>/<see cref="OnEditRelease"/> here instead of
+        /// dragging the target itself. Default: not handled (target drags).
+        /// </summary>
+        public virtual bool OnEditPress(int x, int y) => false;
+
+        /// <summary>Pointer moved while captured via <see cref="OnEditPress"/> (target-local pixels; may go out of bounds).</summary>
+        public virtual void OnEditDrag(int x, int y) { }
+
+        /// <summary>Pointer released — or edit mode ended — while captured via <see cref="OnEditPress"/>.</summary>
+        public virtual void OnEditRelease(int x, int y) { }
 
         /// <summary>Called once per frame, before any target renders. Put game/animation logic here.</summary>
         public abstract void Update(GameTime gameTime);
