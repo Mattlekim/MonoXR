@@ -149,6 +149,42 @@ public sealed unsafe class OverlayManager : IDisposable
         }
     }
 
+    /// <summary>Process id of the attached OpenXR game (published by the layer), or 0 when none is attached.</summary>
+    public uint LayerProcessId => LayerAttached ? Header->LayerPid : 0;
+
+    /// <summary>
+    /// Latest headset pose in World (LOCAL) space, as published by the layer
+    /// each frame. False when no OpenXR app is attached, or the running layer
+    /// predates head-pose publishing (restart the game to load the new DLL).
+    /// </summary>
+    public bool TryGetHeadPose(out System.Numerics.Vector3 position, out System.Numerics.Quaternion rotation)
+    {
+        position = default;
+        rotation = System.Numerics.Quaternion.Identity;
+        if (!LayerAttached) return false;
+
+        // Seqlock reader: retry while the layer is mid-write (odd seq) or the
+        // seq moved under us. A handful of tries is plenty at 90 Hz.
+        var pose = (MonoXrHeadPose*)(_base + MonoXrConstants.HeadPoseOffset);
+        for (int attempt = 0; attempt < 16; attempt++)
+        {
+            uint before = Volatile.Read(ref pose->Seq);
+            if (before == 0) return false;
+            if ((before & 1) != 0) { Thread.SpinWait(64); continue; }
+
+            MonoXrHeadPose copy = *pose;
+            if (Volatile.Read(ref pose->Seq) != before) continue;
+
+            var q = new System.Numerics.Quaternion(copy.QuatX, copy.QuatY, copy.QuatZ, copy.QuatW);
+            float len = q.Length();
+            if (!(len > 0.5f) || float.IsNaN(copy.PosX + copy.PosY + copy.PosZ)) return false;
+            position = new System.Numerics.Vector3(copy.PosX, copy.PosY, copy.PosZ);
+            rotation = System.Numerics.Quaternion.Normalize(q);
+            return true;
+        }
+        return false;
+    }
+
     /// <summary>
     /// Raised (from the thread that calls <see cref="Heartbeat"/>) when the
     /// OpenXR game attaches or goes away — true = attached, false = closed.
@@ -212,9 +248,15 @@ public sealed unsafe class OverlayManager : IDisposable
     /// disposing an overlay are reused, so overlays can be recreated (e.g. at a
     /// new resolution) indefinitely.
     /// </summary>
-    public Overlay CreateOverlay(int width, int height)
+    /// <param name="topmost">
+    /// Take the highest free slot instead of the lowest. The layer composites
+    /// slots in index order, so this keeps e.g. a cursor quad above overlays
+    /// that are recreated later (they reuse the low slots).
+    /// </param>
+    public Overlay CreateOverlay(int width, int height, bool topmost = false)
     {
-        int index = Array.FindIndex(_overlays, o => o is null);
+        int index = topmost ? Array.FindLastIndex(_overlays, o => o is null)
+                            : Array.FindIndex(_overlays, o => o is null);
         if (index < 0)
             throw new InvalidOperationException($"At most {MonoXrConstants.MaxOverlays} overlays are supported.");
         var overlay = new Overlay(this, index, width, height);

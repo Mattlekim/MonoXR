@@ -69,6 +69,14 @@ namespace MonoXR.Client
         public override void Increase() => Toggle();
         public override void Decrease() => Toggle();
 
+        // A click anywhere on the row toggles, like clicking a WPF CheckBox's label.
+        public override bool OnPointerPress(int x, int y)
+        {
+            if (!IsEnabled || !Bounds.Contains(x, y)) return false;
+            Toggle();
+            return true;
+        }
+
         public override void Draw(SpriteBatch spriteBatch, SpriteFont font, Texture2D white)
         {
             DrawSelectionBackground(spriteBatch, white);

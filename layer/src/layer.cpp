@@ -12,6 +12,7 @@
 #include <d3d11_1.h>
 #include <dxgi1_2.h>
 
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <cwchar>
@@ -112,6 +113,7 @@ static PFN_xrDestroySession              down_xrDestroySession = nullptr;
 static PFN_xrEndFrame                    down_xrEndFrame = nullptr;
 static PFN_xrCreateReferenceSpace        down_xrCreateReferenceSpace = nullptr;
 static PFN_xrDestroySpace                down_xrDestroySpace = nullptr;
+static PFN_xrLocateSpace                 down_xrLocateSpace = nullptr;
 static PFN_xrEnumerateSwapchainFormats   down_xrEnumerateSwapchainFormats = nullptr;
 static PFN_xrCreateSwapchain             down_xrCreateSwapchain = nullptr;
 static PFN_xrDestroySwapchain            down_xrDestroySwapchain = nullptr;
@@ -157,6 +159,7 @@ struct SessionState {
     // Shared control block
     HANDLE mapping = nullptr;
     MonoXrControlBlock* control = nullptr;
+    bool controlHasHeadPose = false;        // mapping is big enough for control->headPose
     int openRetry = 0;
 };
 
@@ -173,7 +176,14 @@ static void TryOpenControl(SessionState& s) {
 
     HANDLE h = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, MONOXR_CONTROL_NAME);
     if (!h) return;
+    // A client that predates the head-pose block created a smaller mapping;
+    // fall back to the original size and just don't publish the pose.
+    bool hasHeadPose = true;
     void* view = MapViewOfFile(h, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(MonoXrControlBlock));
+    if (!view) {
+        hasHeadPose = false;
+        view = MapViewOfFile(h, FILE_MAP_ALL_ACCESS, 0, 0, offsetof(MonoXrControlBlock, headPose));
+    }
     if (!view) { CloseHandle(h); return; }
 
     auto* cb = reinterpret_cast<MonoXrControlBlock*>(view);
@@ -183,6 +193,7 @@ static void TryOpenControl(SessionState& s) {
     }
     s.mapping = h;
     s.control = cb;
+    s.controlHasHeadPose = hasHeadPose;
     s.control->layerPid = GetCurrentProcessId();
     s.control->layerActive = 1;
     LogLine("attached to MonoXR control block, client pid=%u", cb->clientPid);
@@ -347,6 +358,28 @@ static bool RenderSlot(SessionState& s, SlotResources& r, const MonoXrOverlaySlo
     return true;
 }
 
+// Publish the headset pose (VIEW located in LOCAL at this frame's display
+// time) so the client can recenter world overlays on the user. Seqlock writer:
+// the interlocked bumps are full barriers, so a reader never sees a torn pose
+// under an even, unchanged seq.
+static void PublishHeadPose(SessionState& s, XrTime displayTime) {
+    if (!s.controlHasHeadPose || !down_xrLocateSpace || !s.headSpace || !s.worldSpace) return;
+
+    XrSpaceLocation loc{ XR_TYPE_SPACE_LOCATION };
+    if (XR_FAILED(down_xrLocateSpace(s.headSpace, s.worldSpace, displayTime, &loc))) return;
+    const XrSpaceLocationFlags need = XR_SPACE_LOCATION_POSITION_VALID_BIT |
+                                      XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
+    if ((loc.locationFlags & need) != need) return;
+
+    MonoXrHeadPose& h = s.control->headPose;
+    volatile LONG* seq = reinterpret_cast<volatile LONG*>(&h.seq);
+    if (InterlockedIncrement(seq) % 2 == 0) InterlockedIncrement(seq); // resync to odd
+    h.posX = loc.pose.position.x; h.posY = loc.pose.position.y; h.posZ = loc.pose.position.z;
+    h.quatX = loc.pose.orientation.x; h.quatY = loc.pose.orientation.y;
+    h.quatZ = loc.pose.orientation.z; h.quatW = loc.pose.orientation.w;
+    if (InterlockedIncrement(seq) == 0) InterlockedExchangeAdd(seq, 2); // 0 means "never published"
+}
+
 // ---------------------------------------------------------------------------
 // Hooked entry points
 // ---------------------------------------------------------------------------
@@ -365,6 +398,8 @@ static XrResult XRAPI_CALL MonoXr_xrEndFrame(XrSession session, const XrFrameEnd
     // something cleared these (e.g. a client that wrongly decided we died).
     s.control->layerActive = 1;
     s.control->layerPid = GetCurrentProcessId();
+
+    PublishHeadPose(s, frameEndInfo->displayTime);
 
     // Storage must outlive the down-call; reserve so pointers stay stable.
     static std::vector<XrCompositionLayerQuad> quads;
@@ -559,6 +594,7 @@ static XrResult XRAPI_CALL MonoXr_xrCreateApiLayerInstance(const XrInstanceCreat
     RESOLVE(xrEndFrame);
     RESOLVE(xrCreateReferenceSpace);
     RESOLVE(xrDestroySpace);
+    RESOLVE(xrLocateSpace);
     RESOLVE(xrEnumerateSwapchainFormats);
     RESOLVE(xrCreateSwapchain);
     RESOLVE(xrDestroySwapchain);

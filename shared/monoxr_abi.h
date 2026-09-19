@@ -56,6 +56,19 @@ struct MonoXrOverlaySlot {
     wchar_t sharedName[MONOXR_NAME_LEN];
 };
 
+// Headset pose in WORLD (LOCAL) space, published by the layer every frame so
+// the client can recenter overlays on where the user is actually sitting.
+// Seqlock: the layer bumps seq to odd, writes the pose, bumps it to even; a
+// reader retries if seq was odd or changed across its read. 0 = never published
+// (no session yet, or a layer build that predates this block).
+struct MonoXrHeadPose {
+    uint32_t seq;
+    uint32_t _pad0;
+    float posX, posY, posZ;
+    float quatX, quatY, quatZ, quatW;
+    uint32_t _pad1;
+};
+
 struct MonoXrControlBlock {
     uint32_t magic;         // MONOXR_MAGIC
     uint32_t version;       // MONOXR_VERSION
@@ -66,9 +79,24 @@ struct MonoXrControlBlock {
     uint32_t layerPid;      // game's process id while layerActive; lets the client
                             // detect a game that died without clearing layerActive
     struct MonoXrOverlaySlot slots[MONOXR_MAX_OVERLAYS];
+
+    // Appended after the slots (rather than grown into the header) so the
+    // header/slot offsets are unchanged and a version-1 layer or client that
+    // predates it keeps working — it simply never sees a head pose.
+    struct MonoXrHeadPose headPose;
 };
 
 #pragma pack(pop)
+
+// Layout guard: these sizes/offsets are hard-coded in shared/MonoXrAbi.cs.
+#ifdef __cplusplus
+#include <cstddef>
+static_assert(sizeof(MonoXrOverlaySlot) == 204, "MonoXrOverlaySlot must match MonoXrAbi.cs SlotSize");
+static_assert(sizeof(MonoXrHeadPose) == 40, "MonoXrHeadPose must match MonoXrAbi.cs HeadPoseSize");
+static_assert(offsetof(MonoXrControlBlock, slots) == 32, "header must match MonoXrAbi.cs HeaderSize");
+static_assert(offsetof(MonoXrControlBlock, headPose) == 3296, "headPose must match MonoXrAbi.cs HeadPoseOffset");
+static_assert(sizeof(MonoXrControlBlock) == 3336, "MonoXrControlBlock must match MonoXrAbi.cs ControlSize");
+#endif
 
 // Keyed-mutex handshake on each shared texture:
 //   producer (client) acquires KEY_PRODUCER, copies RT -> shared, releases KEY_CONSUMER
