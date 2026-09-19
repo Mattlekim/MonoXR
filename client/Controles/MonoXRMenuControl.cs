@@ -18,6 +18,7 @@ namespace MonoXR.Client
     {
         private readonly List<MonoXRControl> _items = new();
         private int _selected = -1;
+        private MonoXRControl? _pointerCapture; // item that claimed the current pointer gesture
 
         public int ItemHeight { get; set; } = 64;
         public int ItemSpacing { get; set; } = 8;
@@ -39,6 +40,7 @@ namespace MonoXR.Client
         {
             _items.Clear();
             _selected = -1;
+            _pointerCapture = null;
         }
 
         public void HandleNavigation(OverlayNavAction action)
@@ -71,6 +73,36 @@ namespace MonoXR.Client
             }
             _selected = i;
             SyncSelection();
+        }
+
+        /// <summary>
+        /// Pointer press: selects the enabled item under the pointer and
+        /// forwards the press to it. Returns true when that item captured the
+        /// gesture (e.g. a slider bar or checkbox was hit).
+        /// </summary>
+        public override bool OnPointerPress(int x, int y)
+        {
+            LayoutItems();
+            for (int i = 0; i < _items.Count; i++)
+            {
+                var item = _items[i];
+                if (!item.IsEnabled || !item.Bounds.Contains(x, y)) continue;
+                _selected = i;
+                SyncSelection();
+                if (!item.OnPointerPress(x, y)) return false;
+                _pointerCapture = item;
+                return true;
+            }
+            return false;
+        }
+
+        public override void OnPointerDrag(int x, int y) => _pointerCapture?.OnPointerDrag(x, y);
+
+        public override void OnPointerRelease(int x, int y)
+        {
+            var cap = _pointerCapture;
+            _pointerCapture = null;
+            cap?.OnPointerRelease(x, y);
         }
 
         public override void Update(GameTime gameTime)

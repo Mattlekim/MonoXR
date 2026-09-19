@@ -170,6 +170,17 @@ What the host does for you:
   and button state are read, so it works while the VR game has focus, and a
   crosshair cursor is drawn on the canvas so the position is visible in VR.
   `DragCompleted` fires with the panel at its final position (persist it there).
+  Each panel's button bar also has **- / 100% / +** size controls and a drag
+  grip in its bottom-right corner; they set `OverlayRenderTarget.Scale` (the
+  host stretches the panel's texture, so panels need no layout code for it) and
+  `ScaleChanged` fires when a resize finishes (persist `Scale` there).
+- **Cursor matching** — while a game is attached, the edit cursor is mapped
+  from the mouse position inside the *game's window* (found via the process id
+  the layer publishes), not the whole monitor. `BeginCursorCalibration()` runs
+  a two-click fit (the user puts the game's own in-VR cursor on a marker and
+  clicks, twice) so the red cross lands on the game's cursor; persist
+  `CursorCalibration` when `CursorCalibrationCompleted` fires and restore it
+  with `SetCursorCalibration`.
 - **Attach handling** — `LayerAttached` / `LayerAttachedChanged` report when a
   game with the layer is running; the host republishes automatically on attach
   and self-heals a wedged shared-texture handshake by rebuilding the overlay.
@@ -177,6 +188,11 @@ What the host does for you:
   size without touching the VR pose; `DisplaySize`/`Distance`/`Overlay.*`
   adjust the quad in VR at any time (call `Invalidate()` after direct
   `Overlay` pose changes).
+- **Recentering** — the layer publishes the headset pose every frame;
+  `Recenter()` centers the overlay on the headset's current line of sight at
+  `Distance`, facing the user (head roll is ignored, so it stays level).
+  Persist `OriginPosition`/`OriginYaw`/`OriginPitch` and restore them with
+  `SetOrigin`.
 
 ## UI controls
 

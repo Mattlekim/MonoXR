@@ -86,9 +86,33 @@ namespace MonoXR.Client
         public virtual int CollapsedWidth => 220;
         public virtual int CollapsedHeight => 44;
 
-        /// <summary>Width currently occupied on the canvas (collapsed bar or full size).</summary>
-        public int DisplayWidth => IsCollapsed ? Math.Min(CollapsedWidth, Width) : Width;
-        public int DisplayHeight => IsCollapsed ? Math.Min(CollapsedHeight, Height) : Height;
+        /// <summary>Texture region that is composited (collapsed bar or the full target), in target pixels.</summary>
+        public int SourceWidth => IsCollapsed ? Math.Min(CollapsedWidth, Width) : Width;
+        public int SourceHeight => IsCollapsed ? Math.Min(CollapsedHeight, Height) : Height;
+
+        public const float MinScale = 0.4f;
+        public const float MaxScale = 3f;
+        private float _scale = 1f;
+
+        /// <summary>
+        /// User-facing size multiplier. The target still renders at its own
+        /// pixel size; the host stretches that texture by this factor when it
+        /// composites it, so every target is resizable without any layout
+        /// code of its own. Clamped to <see cref="MinScale"/>..<see cref="MaxScale"/>.
+        /// </summary>
+        public float Scale
+        {
+            get => _scale;
+            set
+            {
+                float v = float.IsFinite(value) ? Math.Clamp(value, MinScale, MaxScale) : 1f;
+                if (v != _scale) { _scale = v; Invalidate(); }
+            }
+        }
+
+        /// <summary>Size currently occupied on the canvas: the source region times <see cref="Scale"/>.</summary>
+        public int DisplayWidth => Math.Max(1, (int)MathF.Round(SourceWidth * _scale));
+        public int DisplayHeight => Math.Max(1, (int)MathF.Round(SourceHeight * _scale));
 
         /// <summary>
         /// True when this target needs re-rendering and the canvas re-publishing.
@@ -137,6 +161,20 @@ namespace MonoXR.Client
 
         /// <summary>Pointer released — or edit mode ended — while captured via <see cref="OnEditPress"/>.</summary>
         public virtual void OnEditRelease(int x, int y) { }
+
+        /// <summary>
+        /// Pointer press inside this target OUTSIDE edit mode (normal use, e.g.
+        /// dragging a slider), in target-local pixels. Return true to capture
+        /// the gesture so <see cref="OnPointerDrag"/>/<see cref="OnPointerRelease"/>
+        /// follow. Default: not handled (the click does nothing on the overlay).
+        /// </summary>
+        public virtual bool OnPointerPress(int x, int y) => false;
+
+        /// <summary>Pointer moved while captured via <see cref="OnPointerPress"/> (target-local pixels; may go out of bounds).</summary>
+        public virtual void OnPointerDrag(int x, int y) { }
+
+        /// <summary>Pointer released — or edit mode started — while captured via <see cref="OnPointerPress"/>.</summary>
+        public virtual void OnPointerRelease(int x, int y) { }
 
         /// <summary>Called once per frame, before any target renders. Put game/animation logic here.</summary>
         public abstract void Update(GameTime gameTime);

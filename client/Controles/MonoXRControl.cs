@@ -63,6 +63,24 @@ namespace MonoXR.Client
         }
 
         /// <summary>
+        /// Pointer (mouse) press at <paramref name="x"/>,<paramref name="y"/> in
+        /// hosting-overlay pixels. Return true to capture the gesture so
+        /// <see cref="OnPointerDrag"/>/<see cref="OnPointerRelease"/> follow.
+        /// Default: not handled.
+        /// </summary>
+        public virtual bool OnPointerPress(int x, int y) => false;
+
+        /// <summary>Pointer moved while captured via <see cref="OnPointerPress"/> (may be out of bounds).</summary>
+        public virtual void OnPointerDrag(int x, int y)
+        {
+        }
+
+        /// <summary>Pointer released while captured via <see cref="OnPointerPress"/>.</summary>
+        public virtual void OnPointerRelease(int x, int y)
+        {
+        }
+
+        /// <summary>
         /// Draw into the hosting overlay. <paramref name="spriteBatch"/> must already
         /// be inside Begin/End; <paramref name="white"/> is a 1x1 white pixel texture.
         /// </summary>

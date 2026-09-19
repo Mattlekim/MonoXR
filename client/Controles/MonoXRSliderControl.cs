@@ -14,6 +14,8 @@ namespace MonoXR.Client
     public sealed class MonoXRSliderControl : MonoXRControl
     {
         private float _value;
+        private XnaRectangle _track; // value bar as last drawn (empty until drawn)
+        private bool _dragging;
 
         public MonoXRSliderControl(string name, float min, float max, float value,
                                    float step = 1f, string format = "0")
@@ -65,6 +67,35 @@ namespace MonoXR.Client
         public override void Increase() { if (IsEnabled) Value += Step; }
         public override void Decrease() { if (IsEnabled) Value -= Step; }
 
+        // Mouse: press on (or near) the bar jumps the thumb there, dragging
+        // follows the pointer. Uses the bar geometry from the last Draw.
+        public override bool OnPointerPress(int x, int y)
+        {
+            if (!IsEnabled || _track.Width <= 0) return false;
+            var hit = _track;
+            hit.Inflate(14, Math.Max(18, (Bounds.Height - _track.Height) / 2));
+            if (!hit.Contains(x, y)) return false;
+            _dragging = true;
+            SetFromPointer(x);
+            return true;
+        }
+
+        public override void OnPointerDrag(int x, int y)
+        {
+            if (_dragging) SetFromPointer(x);
+        }
+
+        public override void OnPointerRelease(int x, int y) => _dragging = false;
+
+        private void SetFromPointer(int x)
+        {
+            float t = Math.Clamp((x - _track.X) / (float)_track.Width, 0f, 1f);
+            float v = Minimum + t * (Maximum - Minimum);
+            if (Step > 0)
+                v = Minimum + MathF.Round((v - Minimum) / Step) * Step;
+            Value = v;
+        }
+
         public override void Draw(SpriteBatch spriteBatch, SpriteFont font, Texture2D white)
         {
             DrawSelectionBackground(spriteBatch, white);
@@ -82,6 +113,10 @@ namespace MonoXR.Client
             int barW = Bounds.X + Bounds.Width - barX - readoutW - pad * 2;
             int barH = 8;
             int barY = Bounds.Y + (Bounds.Height - barH) / 2;
+            // While dragging keep the track frozen: the readout width changes
+            // with the value, which would otherwise shift the bar under the pointer.
+            if (!_dragging) _track = new XnaRectangle(barX, barY, Math.Max(0, barW), barH);
+            else barW = _track.Width;
             if (barW > 0)
             {
                 float t = Math.Clamp((_value - Minimum) / (Maximum - Minimum), 0f, 1f);
