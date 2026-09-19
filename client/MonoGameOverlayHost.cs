@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Numerics;
 using Microsoft.Xna.Framework.Graphics;
@@ -81,17 +81,17 @@ namespace MonoXR.Client
                 _previewVersion = -1;
             }
 
-            if (_previewVersion != CanvasVersion)
+            if (_previewVersion != PreviewVersion)
             {
-                _previewVersion = CanvasVersion;
+                _previewVersion = PreviewVersion;
                 GraphicsDevice.SetRenderTarget(_previewTarget);
                 // Opaque: a straight copy of the canvas's (premultiplied) pixels, alpha included.
                 _compositor.Begin(SpriteSortMode.Deferred, BlendState.Opaque, SamplerState.LinearClamp);
                 _compositor.Draw(_canvasTarget, new XnaRectangle(0, 0, w, h), XnaColor.White);
                 _compositor.End();
 
-                // Downscaling several-fold (no mips) skips over the canvas's
-                // thin crosshair lines, so redraw it at a preview-visible size.
+                // The crosshair is a separate VR quad, not part of the canvas —
+                // draw it onto the preview at a visible size.
                 if (_calStep == 0)
                 {
                     _compositor.Begin(SpriteSortMode.Deferred, BlendState.AlphaBlend, SamplerState.PointClamp);
@@ -109,6 +109,13 @@ namespace MonoXR.Client
         /// GPU work (the canvas content is unchanged).
         /// </summary>
         public int CanvasVersion { get; private set; }
+
+        /// <summary>
+        /// Bumped whenever the preview image changes: the canvas was recomposed
+        /// OR the cursor moved (the cursor is not part of the canvas). A desktop
+        /// preview should key its readback off this rather than <see cref="CanvasVersion"/>.
+        /// </summary>
+        public int PreviewVersion { get; private set; }
 
         /// <summary>
         /// Physical size of the overlay quad in VR, in meters. Independent of
@@ -225,6 +232,7 @@ namespace MonoXR.Client
                 if (_editMode == value) return;
                 _editMode = value;
                 _canvasDirty = true;
+                if (!value) _selected = null;
                 EditModeChanged?.Invoke(value);
                 // Let targets react (e.g. draw a placeholder while edited).
                 foreach (var rt in _targets)
@@ -291,22 +299,26 @@ namespace MonoXR.Client
         private const int SM_CXSCREEN = 0;
         private const int SM_CYSCREEN = 1;
         private const int VK_LBUTTON = 0x01;
+        private const int VK_RBUTTON = 0x02;
 
         // ----- Edit-mode per-target buttons ---------------------------------
-        // Each target gets a small button bar in edit mode: [Collapse|Expand]
-        // [Hide|Show] and the size controls [-] [100%] [+] (the percentage
-        // resets to 100% when clicked). The bar sits just above the target (or
-        // just inside it when the target touches the canvas top) and keeps
-        // working while the target is hidden — hidden targets are drawn as a
-        // faint ghost at the very back of the canvas so they can still be
-        // found and shown. Visible, expanded targets also get a resize grip in
-        // their bottom-right corner: drag it to scale the target.
+        // Clicking a target in edit mode selects it (clicking empty canvas
+        // clears the selection). Only the selected target gets its button
+        // bar — [Collapse|Expand] [Hide|Show], the opacity controls [-]
+        // [Opacity 100%] [+] (the percentage resets when clicked) and the
+        // optional Bind button — and its resize grip in the bottom-right
+        // corner (drag it to scale the target). The bar sits just above the
+        // target (or just inside it when the target touches the canvas top).
+        // Hidden targets are drawn as a faint ghost at the very back of the
+        // canvas; clicking a ghost selects it so Show stays reachable.
         private const int EditBtnWidth = 130;
         private const int EditBtnHeight = 40;
         private const int EditBtnGap = 8;
         private const int EditStepBtnWidth = 48;   // [-] and [+]
-        private const int EditScaleBtnWidth = 90;  // "100%"
-        private const float EditScaleStep = 0.1f;
+        private const int EditOpacityBtnWidth = 150; // "Opacity 100%"
+        private const float EditOpacityStep = 0.1f;
+        private const int EditBindBtnWidth = 210;    // "Bind: B5+B12"
+        private const int EditShowBtnWidth = 230;    // "Show: In car"
         private const int ResizeGripSize = 30;
 
         /// <summary>
@@ -332,12 +344,31 @@ namespace MonoXR.Client
         /// </summary>
         public Func<bool?>? LeftButtonOverride { get; set; }
 
+        /// <summary>
+        /// Optional right-button source, polled like
+        /// <see cref="LeftButtonOverride"/>. The right button only opens a
+        /// target's own context menu (<see cref="OverlayRenderTarget.OnPointerRightPress"/>)
+        /// and never moves or resizes anything, so edit mode ignores it.
+        /// </summary>
+        public Func<bool?>? RightButtonOverride { get; set; }
+
         private int _cursorX, _cursorY;
         private bool _lmbWasDown;
+        private bool _rmbWasDown;
         private OverlayRenderTarget? _dragTarget;
         private int _dragOffsetX, _dragOffsetY;
         private OverlayRenderTarget? _editCapture; // target that claimed the gesture via OnEditPress
         private OverlayRenderTarget? _pointerCapture; // target that claimed a normal-use press via OnPointerPress
+        private OverlayRenderTarget? _hoverTarget;    // topmost target under the cursor (outside edit mode)
+
+        // The red crosshair is its own small quad (topmost slot) that is only
+        // re-posed as the mouse moves: the canvas is frame-capped and copying
+        // it per mouse move would be costly, so drawing the cursor into it
+        // made the cursor stutter in VR.
+        private const int CursorTexSize = 64;
+        private Overlay _cursorOverlay = null!;
+        private RenderTarget2D _cursorTexture = null!;
+        private bool _cursorPublished;
 
         // In-VR edit toggle (top-right icon): shown while editing, and briefly
         // after the mouse moves otherwise.
@@ -372,9 +403,26 @@ namespace MonoXR.Client
         }
 
         private OverlayRenderTarget? _resizeTarget; // target whose corner grip is being dragged
+        private OverlayRenderTarget? _selected;     // edit-mode selection: shows its buttons + resize grip
+
+        /// <summary>The target selected in edit mode (null when none). Only it shows its buttons and resize grip.</summary>
+        public OverlayRenderTarget? SelectedTarget => _selected;
 
         /// <summary>The render target currently being dragged in edit mode (null when none).</summary>
         public OverlayRenderTarget? DragTarget => _dragTarget;
+
+        /// <summary>
+        /// True while a pointer gesture is in flight: a target being dragged or
+        /// resized, or one that captured the press itself (e.g. a slider inside
+        /// it). Gestures are tracked in CANVAS PIXELS, so a host app must
+        /// postpone anything that re-maps them — above all
+        /// <see cref="SetCanvasResolution"/> — until this goes false: changing
+        /// the mapping mid-gesture slides the content out from under the
+        /// pointer, and when the gesture is what drives the resolution (a DPI
+        /// or size slider) that feeds back on itself.
+        /// </summary>
+        public bool IsPointerGestureActive =>
+            _dragTarget != null || _resizeTarget != null || _editCapture != null || _pointerCapture != null;
 
         /// <summary>
         /// Raised when the user finishes resizing a target in edit mode (a
@@ -383,6 +431,48 @@ namespace MonoXR.Client
         /// the thread that calls <see cref="RenderFrame"/>.
         /// </summary>
         public event Action<OverlayRenderTarget>? ScaleChanged;
+
+        /// <summary>
+        /// Raised when the user changes a target's
+        /// <see cref="OverlayRenderTarget.Opacity"/> with the edit-mode
+        /// opacity buttons. Persist it there. Fires from the thread that calls
+        /// <see cref="RenderFrame"/>.
+        /// </summary>
+        public event Action<OverlayRenderTarget>? OpacityChanged;
+
+        /// <summary>
+        /// Optional: label and highlight for a per-target "Bind" button at the
+        /// end of the edit-mode button bar. When set, the button is shown and
+        /// clicking it raises <see cref="BindRequested"/>; the app does the
+        /// actual input capture (the host knows nothing about controllers).
+        /// Called every composed edit-mode frame.
+        /// </summary>
+        public Func<OverlayRenderTarget, (string Label, bool Active)>? BindButtonLabel { get; set; }
+
+        /// <summary>Raised when a target's edit-mode Bind button is clicked (see <see cref="BindButtonLabel"/>).</summary>
+        public event Action<OverlayRenderTarget>? BindRequested;
+
+        /// <summary>
+        /// Optional: label and highlight for a per-target "Show" button at the
+        /// end of the edit-mode button bar, for choosing when a panel applies.
+        /// The host only draws it — what the choices mean is the app's
+        /// business, which it acts on through
+        /// <see cref="OverlayRenderTarget.Available"/>. Clicking it raises
+        /// <see cref="ShowModeCycleRequested"/>. Called every composed
+        /// edit-mode frame.
+        /// </summary>
+        public Func<OverlayRenderTarget, (string Label, bool Active)>? ShowButtonLabel { get; set; }
+
+        /// <summary>Raised when a target's edit-mode Show button is clicked (see <see cref="ShowButtonLabel"/>).</summary>
+        public event Action<OverlayRenderTarget>? ShowModeCycleRequested;
+
+        /// <summary>
+        /// Force the canvas to be re-composited and republished on the next
+        /// frame. Needed after hiding a target from code outside edit mode:
+        /// hidden targets don't count towards the dirty check, so the old
+        /// frame (still showing it) would otherwise stay up.
+        /// </summary>
+        public void InvalidateCanvas() => _canvasDirty = true;
 
         // Canvas point -> target-local pixels (the target's texture is drawn stretched by Scale).
         private static int ToLocalX(OverlayRenderTarget rt, int canvasX) => (int)((canvasX - rt.X) / rt.Scale);
@@ -514,7 +604,7 @@ namespace MonoXR.Client
             if (_disposed || !EditMode || !TryGetGameCursor(out _, out _)) return false;
             _calStep = 1;
             _calWaitRelease = true;
-            _dragTarget = null; _editCapture = null; _resizeTarget = null;
+            _dragTarget = null; _editCapture = null; _resizeTarget = null; _selected = null;
             _canvasDirty = true;
             return true;
         }
@@ -592,7 +682,8 @@ namespace MonoXR.Client
             {
                 _cursorX = mx;
                 _cursorY = my;
-                _canvasDirty = true; // cursor is drawn on the canvas
+                // No _canvasDirty: the cursor is a separate quad (UpdateCursorOverlay).
+                PreviewVersion++;
                 _lastCursorMove = _inputClock.Elapsed;
             }
             return true;
@@ -627,6 +718,12 @@ namespace MonoXR.Client
                 if (UpdateCursor()) UpdatePointerInput();
                 return;
             }
+
+            // Edit mode is for arranging panels, not using them: no hover, and
+            // no context menus — but keep tracking the right button so letting
+            // go of it here can't look like a fresh press afterwards.
+            SetHover(null, 0, 0);
+            _rmbWasDown = PollRightButton();
 
             // Entering edit mode ends any normal-use gesture.
             if (_pointerCapture != null)
@@ -666,11 +763,22 @@ namespace MonoXR.Client
                 if (!HandleEditButtonClick(mx, my))
                 {
                     var hit = HitTest(mx, my);
-                    // The corner grip wins over everything inside the target;
-                    // then the target gets first refusal (e.g. dragging an
-                    // internal element like a column header); otherwise the
-                    // whole target drags as before.
-                    if (hit != null && !hit.IsCollapsed && GetResizeGrip(hit).Contains(mx, my))
+                    bool wasSelected = hit != null && hit == _selected;
+
+                    // Select what was clicked (a hidden target's ghost too,
+                    // so it can be shown again); empty canvas deselects.
+                    var select = hit ?? HitTestHidden(mx, my);
+                    if (select != _selected)
+                    {
+                        _selected = select;
+                        _canvasDirty = true;
+                    }
+
+                    // The corner grip (selected target only) wins over
+                    // everything inside the target; then the target gets first
+                    // refusal (e.g. dragging an internal element like a column
+                    // header); otherwise the whole target drags as before.
+                    if (hit != null && wasSelected && !hit.IsCollapsed && GetResizeGrip(hit).Contains(mx, my))
                     {
                         _resizeTarget = hit;
                         _canvasDirty = true;
@@ -736,9 +844,38 @@ namespace MonoXR.Client
         /// Outside edit mode: route the pointer to the target under it
         /// (OnPointerPress/Drag/Release) — no dragging, resizing or button bars.
         /// </summary>
+        /// <summary>
+        /// Tell targets which one the pointer is over, so a clickable one can
+        /// highlight what a press would hit. Only the topmost target under the
+        /// cursor is told, and only outside edit mode.
+        /// </summary>
+        private void SetHover(OverlayRenderTarget? rt, int mx, int my)
+        {
+            if (!ReferenceEquals(rt, _hoverTarget))
+            {
+                _hoverTarget?.OnPointerExit();
+                _hoverTarget = rt;
+            }
+            rt?.OnPointerMove(ToLocalX(rt, mx), ToLocalY(rt, my));
+        }
+
+        private bool PollRightButton() =>
+            RightButtonOverride?.Invoke() ?? ((GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0);
+
         private void UpdatePointerInput()
         {
             int mx = _cursorX, my = _cursorY;
+            SetHover(_pointerCapture ?? HitTest(mx, my), mx, my);
+
+            // Right button: press only, straight to the target under it.
+            bool rmb = PollRightButton();
+            if (rmb && !_rmbWasDown)
+            {
+                var menuHit = HitTest(mx, my);
+                if (menuHit != null && menuHit.OnPointerRightPress(ToLocalX(menuHit, mx), ToLocalY(menuHit, my)))
+                    _canvasDirty = true;
+            }
+            _rmbWasDown = rmb;
             bool lmb = LeftButtonOverride?.Invoke()
                        ?? ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0);
 
@@ -771,13 +908,28 @@ namespace MonoXR.Client
             _lmbWasDown = lmb;
         }
 
-        /// <summary>Edit-mode button rects for a target, left to right: Collapse, Hide, -, scale%, +.</summary>
-        private (XnaRectangle Collapse, XnaRectangle Hide, XnaRectangle Smaller, XnaRectangle ScaleReset, XnaRectangle Larger)
+        /// <summary>
+        /// Edit-mode button rects for a target, left to right: Collapse, Hide,
+        /// then -, opacity%, + for transparency, then Bind (when enabled).
+        /// An <see cref="OverlayRenderTarget.EditModeOnly"/> target keeps only
+        /// the opacity controls: it is gone the moment edit mode ends, so
+        /// collapsing it, hiding it or binding a show/hide button to it has
+        /// nothing to act on. Buttons a target doesn't get come back empty.
+        /// </summary>
+        private (XnaRectangle Collapse, XnaRectangle Hide,
+                 XnaRectangle Fainter, XnaRectangle OpacityReset, XnaRectangle Stronger,
+                 XnaRectangle Bind, XnaRectangle Show)
             GetEditButtons(OverlayRenderTarget rt)
         {
             int by = rt.Y - EditBtnHeight - 6;
             if (by < 0) by = rt.Y + 6; // target touches the canvas top: bar goes inside
-            int barW = EditBtnWidth * 2 + EditStepBtnWidth * 2 + EditScaleBtnWidth + EditBtnGap * 4;
+            bool hasState = !rt.EditModeOnly;
+            bool hasBind = BindButtonLabel != null && !rt.EditModeOnly;
+            bool hasShow = ShowButtonLabel != null && !rt.EditModeOnly;
+            int barW = (hasState ? (EditBtnWidth + EditBtnGap) * 2 : 0)
+                     + EditStepBtnWidth * 2 + EditOpacityBtnWidth + EditBtnGap * 2
+                     + (hasBind ? EditBindBtnWidth + EditBtnGap : 0)
+                     + (hasShow ? EditShowBtnWidth + EditBtnGap : 0);
             int bx = Math.Clamp(rt.X, 0, Math.Max(0, CanvasWidth - barW));
 
             XnaRectangle Next(int width)
@@ -786,8 +938,13 @@ namespace MonoXR.Client
                 bx += width + EditBtnGap;
                 return r;
             }
-            return (Next(EditBtnWidth), Next(EditBtnWidth),
-                    Next(EditStepBtnWidth), Next(EditScaleBtnWidth), Next(EditStepBtnWidth));
+            // Tuple elements are evaluated left to right, so Next() lays the
+            // bar out in the order the buttons are drawn.
+            return (hasState ? Next(EditBtnWidth) : XnaRectangle.Empty,
+                    hasState ? Next(EditBtnWidth) : XnaRectangle.Empty,
+                    Next(EditStepBtnWidth), Next(EditOpacityBtnWidth), Next(EditStepBtnWidth),
+                    hasBind ? Next(EditBindBtnWidth) : XnaRectangle.Empty,
+                    hasShow ? Next(EditShowBtnWidth) : XnaRectangle.Empty);
         }
 
         /// <summary>Resize grip: the bottom-right corner square of a target's displayed bounds.</summary>
@@ -797,43 +954,68 @@ namespace MonoXR.Client
             return new XnaRectangle(rt.X + rt.DisplayWidth - size, rt.Y + rt.DisplayHeight - size, size, size);
         }
 
-        private void SetScaleFromButton(OverlayRenderTarget rt, float scale)
+        private void SetOpacityFromButton(OverlayRenderTarget rt, float opacity)
         {
-            // Snap button steps to whole 10% so repeated clicks land on clean values.
-            rt.Scale = MathF.Round(scale / EditScaleStep) * EditScaleStep;
-            ClampToCanvas(rt);
+            // Snap to whole 10% steps so repeated clicks land on clean values.
+            rt.Opacity = MathF.Round(opacity / EditOpacityStep) * EditOpacityStep;
             _canvasDirty = true;
-            ScaleChanged?.Invoke(rt);
+            OpacityChanged?.Invoke(rt);
         }
 
         /// <summary>
-        /// Toggle Collapse/Hide if the click landed on a target's edit button
-        /// (topmost target first). Works for hidden targets too — that's how
-        /// they are shown again. Returns true when a button was hit.
+        /// Handle a click on the selected target's edit buttons (the only
+        /// target showing them). Works for a selected hidden target too —
+        /// that's how it is shown again. Returns true when a button was hit.
         /// </summary>
         private bool HandleEditButtonClick(int mx, int my)
         {
-            for (int i = _targets.Count - 1; i >= 0; i--)
+            var rt = _selected;
+            if (rt != null)
             {
-                var rt = _targets[i];
-                var (collapse, hide, smaller, scaleReset, larger) = GetEditButtons(rt);
-                if (collapse.Contains(mx, my))
+                var (collapse, hide, fainter, opacityReset, stronger, bind, show) = GetEditButtons(rt);
+                if (!bind.IsEmpty && bind.Contains(mx, my))
+                {
+                    BindRequested?.Invoke(rt);
+                    _canvasDirty = true;
+                    return true;
+                }
+                if (!show.IsEmpty && show.Contains(mx, my))
+                {
+                    ShowModeCycleRequested?.Invoke(rt);
+                    _canvasDirty = true;
+                    return true;
+                }
+                if (!collapse.IsEmpty && collapse.Contains(mx, my))
                 {
                     rt.State = rt.IsCollapsed ? OverlayTargetState.Visible : OverlayTargetState.Collapsed;
                     _canvasDirty = true;
                     return true;
                 }
-                if (hide.Contains(mx, my))
+                if (!hide.IsEmpty && hide.Contains(mx, my))
                 {
                     rt.State = rt.Visible ? OverlayTargetState.Hidden : OverlayTargetState.Visible;
                     _canvasDirty = true;
                     return true;
                 }
-                if (smaller.Contains(mx, my)) { SetScaleFromButton(rt, rt.Scale - EditScaleStep); return true; }
-                if (larger.Contains(mx, my)) { SetScaleFromButton(rt, rt.Scale + EditScaleStep); return true; }
-                if (scaleReset.Contains(mx, my)) { SetScaleFromButton(rt, 1f); return true; }
+                if (fainter.Contains(mx, my)) { SetOpacityFromButton(rt, rt.Opacity - EditOpacityStep); return true; }
+                if (stronger.Contains(mx, my)) { SetOpacityFromButton(rt, rt.Opacity + EditOpacityStep); return true; }
+                if (opacityReset.Contains(mx, my)) { SetOpacityFromButton(rt, 1f); return true; }
             }
             return false;
+        }
+
+        /// <summary>Topmost hidden target (drawn as a ghost in edit mode) whose bounds contain the point.</summary>
+        private OverlayRenderTarget? HitTestHidden(int mx, int my)
+        {
+            for (int i = _targets.Count - 1; i >= 0; i--)
+            {
+                var rt = _targets[i];
+                if (rt.Visible) continue;
+                if (!rt.IsLive && !EditMode) continue;
+                if (mx >= rt.X && mx < rt.X + rt.DisplayWidth && my >= rt.Y && my < rt.Y + rt.DisplayHeight)
+                    return rt;
+            }
+            return null;
         }
 
         /// <summary>Topmost (last-added) shown target whose displayed bounds contain the point.</summary>
@@ -843,6 +1025,7 @@ namespace MonoXR.Client
             {
                 var rt = _targets[i];
                 if (!rt.Visible) continue;
+                if (!rt.IsLive && !EditMode) continue;
                 if (mx >= rt.X && mx < rt.X + rt.DisplayWidth && my >= rt.Y && my < rt.Y + rt.DisplayHeight)
                     return rt;
             }
@@ -892,6 +1075,10 @@ namespace MonoXR.Client
             _overlay.Size = new Vector2(2.5f, 2.5f);
             _overlay.Visible = true;
             ApplyPose(); // 3m straight ahead of the world origin
+
+            _cursorTexture = new RenderTarget2D(GraphicsDevice, CursorTexSize, CursorTexSize);
+            RenderCursorTexture();
+            _cursorOverlay = _mgr.CreateOverlay(CursorTexSize, CursorTexSize, topmost: true);
         }
 
         /// <summary>
@@ -953,6 +1140,7 @@ namespace MonoXR.Client
             // between samples on capped ticks). Changes just mark things
             // dirty; the actual render still happens at the capped rate.
             UpdateEditInput();
+            UpdateCursorOverlay();
 
             // Frame-rate cap: skip the whole frame if it is too soon. The
             // skipped time is not lost — the next processed frame's delta
@@ -970,6 +1158,7 @@ namespace MonoXR.Client
             foreach (var rt in _targets)
             {
                 if (!rt.Visible && !EditMode) continue;
+                if (!rt.IsLive && !EditMode) continue;
                 rt.Update(gameTime);
             }
 
@@ -981,6 +1170,7 @@ namespace MonoXR.Client
             foreach (var rt in _targets)
             {
                 if (!rt.Visible && !EditMode) continue;
+                if (!rt.IsLive && !EditMode) continue;
                 anyDirty |= rt.IsDirty;
             }
             if (!anyDirty)
@@ -997,6 +1187,7 @@ namespace MonoXR.Client
             {
                 if (!rt.IsDirty) continue;
                 if (!rt.Visible && !EditMode) continue;
+                if (!rt.IsLive && !EditMode) continue;
                 GraphicsDevice.SetRenderTarget(rt.Target);
                 rt.Render(gameTime);
                 rt.ClearDirty();
@@ -1020,6 +1211,7 @@ namespace MonoXR.Client
             else ComposeTargets();
             GraphicsDevice.SetRenderTarget(null);
             CanvasVersion++;
+            PreviewVersion++;
 
             // Publish with a device-local GPU copy — no readback, no upload.
             // If the layer held the shared texture this instant (publish
@@ -1072,13 +1264,14 @@ namespace MonoXR.Client
             foreach (var rt in _targets)
             {
                 if (!rt.Visible) continue;
+                if (!rt.IsLive && !EditMode) continue;
                 // Collapsed targets only contribute their top-left name-bar
                 // region (the subclass draws the bar there when collapsed).
                 // The source region is stretched to the Scale-d display size.
                 var src = new XnaRectangle(0, 0, rt.SourceWidth, rt.SourceHeight);
                 _compositor.Draw(rt.Target,
                     new XnaRectangle(rt.X, rt.Y, rt.DisplayWidth, rt.DisplayHeight),
-                    src, XnaColor.White);
+                    src, XnaColor.White * rt.Opacity);
             }
             _compositor.End();
             if (EditMode)
@@ -1095,22 +1288,25 @@ namespace MonoXR.Client
                 _compositor.Draw(_whitePixel, new XnaRectangle(w - t, t, t, h - 2 * t), XnaColor.Red);
 
                 // Outline each target so its bounds are obvious; the one being
-                // dragged is highlighted, hidden ghosts get a dim outline.
+                // dragged/resized is highlighted, the selection is cyan and
+                // hidden ghosts get a dim outline.
                 foreach (var rt in _targets)
                 {
                     int dw = rt.DisplayWidth, dh = rt.DisplayHeight;
                     bool active = rt == _dragTarget || rt == _resizeTarget;
-                    var c = active      ? XnaColor.Lime
-                          : !rt.Visible ? XnaColor.Gray * 0.5f
-                                        : XnaColor.Yellow;
+                    var c = active          ? XnaColor.Lime
+                          : rt == _selected ? XnaColor.Cyan
+                          : !rt.Visible     ? XnaColor.Gray * 0.5f
+                                            : XnaColor.Yellow;
                     _compositor.Draw(_whitePixel, new XnaRectangle(rt.X, rt.Y, dw, 2), c);
                     _compositor.Draw(_whitePixel, new XnaRectangle(rt.X, rt.Y + dh - 2, dw, 2), c);
                     _compositor.Draw(_whitePixel, new XnaRectangle(rt.X, rt.Y, 2, dh), c);
                     _compositor.Draw(_whitePixel, new XnaRectangle(rt.X + dw - 2, rt.Y, 2, dh), c);
 
                     // Resize grip: diagonal "stair" in the bottom-right corner
-                    // (only where dragging it works — shown, expanded targets).
-                    if (rt.Visible && !rt.IsCollapsed)
+                    // (only where dragging it works — the selected target,
+                    // shown and expanded).
+                    if (rt == _selected && rt.Visible && !rt.IsCollapsed)
                     {
                         var grip = GetResizeGrip(rt);
                         const int bar = 5;
@@ -1123,16 +1319,28 @@ namespace MonoXR.Client
                     }
                 }
 
-                // Per-target button bars (also on hidden ghosts, so Show
-                // remains reachable): Collapse / Hide, then the size controls.
-                foreach (var rt in _targets)
+                // Button bar for the selected target only (also when it is a
+                // hidden ghost, so Show stays reachable): Collapse / Hide,
+                // opacity, Bind.
+                if (_selected is { } sel)
                 {
-                    var (collapse, hide, smaller, scaleReset, larger) = GetEditButtons(rt);
-                    DrawEditButton(collapse, rt.IsCollapsed ? "Expand" : "Collapse", rt.IsCollapsed);
-                    DrawEditButton(hide, rt.Visible ? "Hide" : "Show", !rt.Visible);
-                    DrawEditButton(smaller, "-", false);
-                    DrawEditButton(scaleReset, $"{MathF.Round(rt.Scale * 100f):0}%", rt.Scale != 1f);
-                    DrawEditButton(larger, "+", false);
+                    var rt = sel;
+                    var (collapse, hide, fainter, opacityReset, stronger, bind, show) = GetEditButtons(rt);
+                    if (!collapse.IsEmpty) DrawEditButton(collapse, rt.IsCollapsed ? "Expand" : "Collapse", rt.IsCollapsed);
+                    if (!hide.IsEmpty) DrawEditButton(hide, rt.Visible ? "Hide" : "Show", !rt.Visible);
+                    DrawEditButton(fainter, "-", false);
+                    DrawEditButton(opacityReset, $"Opacity {MathF.Round(rt.Opacity * 100f):0}%", rt.Opacity < 1f);
+                    DrawEditButton(stronger, "+", false);
+                    if (!bind.IsEmpty && BindButtonLabel != null)
+                    {
+                        var (label, active) = BindButtonLabel(rt);
+                        DrawEditButton(bind, label, active);
+                    }
+                    if (!show.IsEmpty && ShowButtonLabel != null)
+                    {
+                        var (label, active) = ShowButtonLabel(rt);
+                        DrawEditButton(show, label, active);
+                    }
                 }
 
                 _compositor.End();
@@ -1146,16 +1354,44 @@ namespace MonoXR.Client
                 _compositor.End();
             }
 
-            // Crosshair cursor at the mapped mouse position, visible in VR
-            // whether or not edit mode is on.
-            // Sized in meters (via the canvas px/m) so it looks the same in VR
-            // whatever the canvas resolution is.
-            float pxPerMeter = DisplaySize.X > 0 ? CanvasWidth / DisplaySize.X : 768f;
-            int half = Math.Max(12, (int)MathF.Round(CursorHalfLengthMeters * pxPerMeter));
-            int thick = Math.Max(3, (int)MathF.Round(CursorThicknessMeters * pxPerMeter));
+            // (The crosshair is not drawn here — see UpdateCursorOverlay.)
+        }
+
+        /// <summary>
+        /// Place the crosshair quad over the cursor's canvas position, on the
+        /// canvas plane. Runs on every RenderFrame call (not frame-capped) and
+        /// only rewrites the pose, which the layer reads every VR frame.
+        /// </summary>
+        private void UpdateCursorOverlay()
+        {
+            var canvas = _overlay;
+            _cursorOverlay.Space = canvas.Space;
+            _cursorOverlay.Rotation = canvas.Rotation;
+            _cursorOverlay.Size = new Vector2(CursorHalfLengthMeters * 2f, CursorHalfLengthMeters * 2f);
+            // Hidden while calibrating (the user lines up the GAME'S cursor then).
+            _cursorOverlay.Visible = canvas.Visible && _calStep == 0;
+
+            // Quad-local: centered, +X right, +Y up, in meters.
+            float u = (_cursorX + 0.5f) / CanvasWidth, v = (_cursorY + 0.5f) / CanvasHeight;
+            var local = new Vector3((u - 0.5f) * canvas.Size.X, (0.5f - v) * canvas.Size.Y, 0f);
+            _cursorOverlay.Position = canvas.Position + Vector3.Transform(local, canvas.Rotation);
+
+            if (_cursorPublished)
+                _cursorOverlay.UpdatePose();
+            else
+                _cursorPublished = _cursorOverlay.Update(MonoGameInterop.GetTexturePointer(_cursorTexture));
+        }
+
+        /// <summary>Draw the crosshair texture for the cursor quad (once).</summary>
+        private void RenderCursorTexture()
+        {
+            GraphicsDevice.SetRenderTarget(_cursorTexture);
+            GraphicsDevice.Clear(XnaColor.Transparent);
+            int thick = (int)MathF.Round(CursorTexSize * CursorThicknessMeters / (CursorHalfLengthMeters * 2f));
             _compositor.Begin(SpriteSortMode.Deferred, BlendState.AlphaBlend, SamplerState.PointClamp);
-            DrawCrosshair(_cursorX, _cursorY, half, thick);
+            DrawCrosshair(CursorTexSize / 2, CursorTexSize / 2, CursorTexSize / 2, Math.Max(2, thick));
             _compositor.End();
+            GraphicsDevice.SetRenderTarget(null);
         }
 
         // Crosshair size: 12 px arm / 3 px line at the default 768 px/m.
@@ -1321,6 +1557,8 @@ namespace MonoXR.Client
             _compositor.Dispose();
             _previewTarget?.Dispose();
             _canvasTarget.Dispose();
+            _cursorOverlay.Dispose();
+            _cursorTexture.Dispose();
             _overlay.Dispose();
             _mgr.Dispose();
             GraphicsDevice.Dispose();

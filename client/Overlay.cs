@@ -163,6 +163,18 @@ public sealed unsafe class Overlay : IDisposable
         return true;
     }
 
+    /// <summary>
+    /// Push only the pose/size/visibility to the layer, keeping the last
+    /// published pixels. Costs nothing on the GPU, so it can run every tick
+    /// (e.g. to move a cursor quad). Call after the first successful
+    /// <see cref="Update(IntPtr)"/> — before that the slot stays hidden.
+    /// </summary>
+    public void UpdatePose()
+    {
+        if (_disposed) return;
+        WriteMetadata(_mgr.Slot(_index));
+    }
+
     private void WriteMetadata(MonoXrOverlaySlot* slot)
     {
         slot->Visible = Visible ? 1u : 0u;

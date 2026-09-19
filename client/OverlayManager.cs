@@ -248,9 +248,15 @@ public sealed unsafe class OverlayManager : IDisposable
     /// disposing an overlay are reused, so overlays can be recreated (e.g. at a
     /// new resolution) indefinitely.
     /// </summary>
-    public Overlay CreateOverlay(int width, int height)
+    /// <param name="topmost">
+    /// Take the highest free slot instead of the lowest. The layer composites
+    /// slots in index order, so this keeps e.g. a cursor quad above overlays
+    /// that are recreated later (they reuse the low slots).
+    /// </param>
+    public Overlay CreateOverlay(int width, int height, bool topmost = false)
     {
-        int index = Array.FindIndex(_overlays, o => o is null);
+        int index = topmost ? Array.FindLastIndex(_overlays, o => o is null)
+                            : Array.FindIndex(_overlays, o => o is null);
         if (index < 0)
             throw new InvalidOperationException($"At most {MonoXrConstants.MaxOverlays} overlays are supported.");
         var overlay = new Overlay(this, index, width, height);
