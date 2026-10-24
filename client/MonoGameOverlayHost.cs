@@ -197,6 +197,61 @@ namespace MonoXR.Client
             _canvasDirty = true;
         }
 
+        /// <summary>
+        /// Latest headset pose in world space, as published by the layer each
+        /// frame. False when no OpenXR app is attached, or the running layer
+        /// predates head-pose publishing.
+        /// </summary>
+        public bool TryGetHeadPose(out Vector3 position, out Quaternion rotation)
+        {
+            position = default;
+            rotation = Quaternion.Identity;
+            return !_disposed && _mgr.TryGetHeadPose(out position, out rotation);
+        }
+
+        /// <summary>
+        /// Where the headset's line of sight crosses the overlay canvas, in
+        /// canvas pixels (the same coordinates as the edit cursor and target
+        /// positions). The point can fall outside the canvas, which just means
+        /// the user is looking past the overlay; false means no pose is
+        /// available, or the canvas is behind the head or edge-on to it.
+        /// </summary>
+        public bool TryGetGazeCanvasPoint(out float x, out float y)
+        {
+            x = 0f;
+            y = 0f;
+            if (!TryGetHeadPose(out Vector3 eye, out Quaternion head)) return false;
+
+            var size = DisplaySize;
+            if (!(size.X > 0f) || !(size.Y > 0f)) return false;
+
+            // The canvas quad, exactly as ApplyPose places it: centered
+            // _distance along the origin's look direction, its own +X to the
+            // right, +Y up and +Z back out toward the user.
+            var quad = Quaternion.CreateFromYawPitchRoll(OriginYaw, OriginPitch, 0f);
+            Vector3 center = OriginPosition + Vector3.Transform(new Vector3(0f, 0f, -_distance), quad);
+            Vector3 right = Vector3.Transform(Vector3.UnitX, quad);
+            Vector3 up = Vector3.Transform(Vector3.UnitY, quad);
+            Vector3 normal = Vector3.Transform(Vector3.UnitZ, quad);
+
+            Vector3 look = Vector3.Transform(-Vector3.UnitZ, head);
+            float lookLen = look.Length();
+            if (!(lookLen > 1e-4f)) return false;
+            look /= lookLen;
+
+            // Ray/plane intersection. A near-zero denominator means the line of
+            // sight runs along the canvas plane, so there is no usable hit.
+            float denom = Vector3.Dot(look, normal);
+            if (MathF.Abs(denom) < 1e-4f) return false;
+            float t = Vector3.Dot(center - eye, normal) / denom;
+            if (t <= 0f) return false; // canvas is behind the head
+
+            Vector3 local = eye + look * t - center;
+            x = (Vector3.Dot(local, right) / size.X + 0.5f) * CanvasWidth;
+            y = (0.5f - Vector3.Dot(local, up) / size.Y) * CanvasHeight;
+            return float.IsFinite(x) && float.IsFinite(y);
+        }
+
         /// <summary>True while an OpenXR app with the MonoXR layer is running (and its process is alive).</summary>
         public bool LayerAttached => _mgr.LayerAttached;
 
