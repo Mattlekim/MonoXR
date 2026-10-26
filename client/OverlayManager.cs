@@ -185,6 +185,67 @@ public sealed unsafe class OverlayManager : IDisposable
         return false;
     }
 
+    private MonoXrEyeGaze* EyeGazeBlock => (MonoXrEyeGaze*)(_base + MonoXrConstants.EyeGazeOffset);
+
+    /// <summary>
+    /// Ask the layer to poll the headset's eye tracker (true) or leave it alone
+    /// (false). The layer never reads the user's eyes unless this is set, so
+    /// keep it off whenever eye gaze is not being used.
+    /// </summary>
+    public bool EyeGazeRequested
+    {
+        get => Volatile.Read(ref EyeGazeBlock->Request) != 0;
+        set => Volatile.Write(ref EyeGazeBlock->Request, value ? 1u : 0u);
+    }
+
+    /// <summary>
+    /// What the layer knows about eye tracking: whether the headset and the
+    /// game allow it, whether it was asked for, and whether a gaze is coming
+    /// in. <see cref="MonoXrGazeState.Unknown"/> when no OpenXR app is
+    /// attached or the running layer DLL predates eye gaze.
+    /// </summary>
+    public MonoXrGazeState EyeGazeState
+    {
+        get
+        {
+            if (!LayerAttached) return MonoXrGazeState.Unknown;
+            var gaze = EyeGazeBlock;
+            return Volatile.Read(ref gaze->Seq) == 0 ? MonoXrGazeState.Unknown : (MonoXrGazeState)gaze->State;
+        }
+    }
+
+    /// <summary>
+    /// Latest eye gaze ray in World (LOCAL) space: <paramref name="position"/>
+    /// is between the eyes and the gaze runs along the rotation's -Z, like the
+    /// head pose. False unless the layer reports a live gaze right now.
+    /// </summary>
+    public bool TryGetEyeGaze(out System.Numerics.Vector3 position, out System.Numerics.Quaternion rotation)
+    {
+        position = default;
+        rotation = System.Numerics.Quaternion.Identity;
+        if (!LayerAttached) return false;
+
+        var gaze = EyeGazeBlock;
+        for (int attempt = 0; attempt < 16; attempt++)
+        {
+            uint before = Volatile.Read(ref gaze->Seq);
+            if (before == 0) return false;
+            if ((before & 1) != 0) { Thread.SpinWait(64); continue; }
+
+            MonoXrEyeGaze copy = *gaze;
+            if (Volatile.Read(ref gaze->Seq) != before) continue;
+
+            if (copy.State != (uint)MonoXrGazeState.Tracking) return false;
+            var q = new System.Numerics.Quaternion(copy.QuatX, copy.QuatY, copy.QuatZ, copy.QuatW);
+            float len = q.Length();
+            if (!(len > 0.5f) || float.IsNaN(copy.PosX + copy.PosY + copy.PosZ)) return false;
+            position = new System.Numerics.Vector3(copy.PosX, copy.PosY, copy.PosZ);
+            rotation = System.Numerics.Quaternion.Normalize(q);
+            return true;
+        }
+        return false;
+    }
+
     /// <summary>
     /// Raised (from the thread that calls <see cref="Heartbeat"/>) when the
     /// OpenXR game attaches or goes away — true = attached, false = closed.
@@ -270,6 +331,7 @@ public sealed unsafe class OverlayManager : IDisposable
     {
         if (_disposed) return;
         _disposed = true;
+        if (_base != null) Volatile.Write(ref EyeGazeBlock->Request, 0u); // stop the layer polling the eyes
         foreach (var o in _overlays) o?.Dispose();
         Array.Clear(_overlays, 0, _overlays.Length);
         if (_base != null) _view.SafeMemoryMappedViewHandle.ReleasePointer();

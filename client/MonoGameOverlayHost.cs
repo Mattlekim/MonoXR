@@ -261,6 +261,20 @@ namespace MonoXR.Client
         }
 
         /// <summary>
+        /// Ask the layer to poll the headset's eye tracker. Needed for
+        /// <see cref="TryGetEyeGazeCanvasPoint"/>; leave it off otherwise so
+        /// nothing reads the user's eyes while eye gaze is not in use.
+        /// </summary>
+        public bool EyeGazeRequested
+        {
+            get => !_disposed && _mgr.EyeGazeRequested;
+            set { if (!_disposed) _mgr.EyeGazeRequested = value; }
+        }
+
+        /// <summary>What the layer reports about eye tracking (see <see cref="MonoXrGazeState"/>).</summary>
+        public MonoXrGazeState EyeGazeState => _disposed ? MonoXrGazeState.Unknown : _mgr.EyeGazeState;
+
+        /// <summary>
         /// Where the headset's line of sight crosses the overlay canvas, in
         /// canvas pixels (the same coordinates as the edit cursor and target
         /// positions). The point can fall outside the canvas, which just means
@@ -271,7 +285,28 @@ namespace MonoXR.Client
         {
             x = 0f;
             y = 0f;
-            if (!TryGetHeadPose(out Vector3 eye, out Quaternion head)) return false;
+            return TryGetHeadPose(out Vector3 eye, out Quaternion head) && CanvasPointOfRay(eye, head, out x, out y);
+        }
+
+        /// <summary>
+        /// Where the user's eyes are looking on the overlay canvas, in the same
+        /// canvas pixels as <see cref="TryGetGazeCanvasPoint"/>. False unless
+        /// the layer reports a live eye gaze (<see cref="EyeGazeRequested"/>
+        /// must be on, and the headset must have working eye tracking).
+        /// </summary>
+        public bool TryGetEyeGazeCanvasPoint(out float x, out float y)
+        {
+            x = 0f;
+            y = 0f;
+            return !_disposed && _mgr.TryGetEyeGaze(out Vector3 eye, out Quaternion gaze) &&
+                   CanvasPointOfRay(eye, gaze, out x, out y);
+        }
+
+        // Intersect a ray (origin plus the rotation's -Z) with the canvas plane.
+        private bool CanvasPointOfRay(Vector3 eye, Quaternion head, out float x, out float y)
+        {
+            x = 0f;
+            y = 0f;
 
             var size = DisplaySize;
             if (!(size.X > 0f) || !(size.Y > 0f)) return false;

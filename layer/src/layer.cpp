@@ -122,6 +122,26 @@ static PFN_xrAcquireSwapchainImage       down_xrAcquireSwapchainImage = nullptr;
 static PFN_xrWaitSwapchainImage          down_xrWaitSwapchainImage = nullptr;
 static PFN_xrReleaseSwapchainImage       down_xrReleaseSwapchainImage = nullptr;
 
+// Eye gaze (XR_EXT_eye_gaze_interaction). The layer owns one pose action bound
+// to the gaze path; the app's own action sets are left alone and ours is merged
+// into its xrAttachSessionActionSets / xrSyncActions calls.
+static PFN_xrGetSystemProperties             down_xrGetSystemProperties = nullptr;
+static PFN_xrStringToPath                    down_xrStringToPath = nullptr;
+static PFN_xrCreateActionSet                 down_xrCreateActionSet = nullptr;
+static PFN_xrDestroyActionSet                down_xrDestroyActionSet = nullptr;
+static PFN_xrCreateAction                    down_xrCreateAction = nullptr;
+static PFN_xrDestroyAction                   down_xrDestroyAction = nullptr;
+static PFN_xrSuggestInteractionProfileBindings down_xrSuggestInteractionProfileBindings = nullptr;
+static PFN_xrAttachSessionActionSets         down_xrAttachSessionActionSets = nullptr;
+static PFN_xrSyncActions                     down_xrSyncActions = nullptr;
+static PFN_xrCreateActionSpace               down_xrCreateActionSpace = nullptr;
+static PFN_xrGetActionStatePose              down_xrGetActionStatePose = nullptr;
+
+static XrInstance g_instance = XR_NULL_HANDLE;
+static bool       g_eyeExtEnabled = false;   // XR_EXT_eye_gaze_interaction is on for this instance
+static XrPath     g_eyeProfilePath = XR_NULL_PATH;
+static XrPath     g_eyeGazePosePath = XR_NULL_PATH;
+
 // ---------------------------------------------------------------------------
 // Per-overlay GPU resources, lazily built to match a control-block slot.
 // ---------------------------------------------------------------------------
@@ -160,8 +180,29 @@ struct SessionState {
     HANDLE mapping = nullptr;
     MonoXrControlBlock* control = nullptr;
     bool controlHasHeadPose = false;        // mapping is big enough for control->headPose
+    bool controlHasEyeGaze = false;         // ... and for control->eyeGaze
     int openRetry = 0;
+
+    // Eye gaze. gazeSupported: the system reports eye gaze interaction and our
+    // action exists. gazeAttached: our action set went into the app's
+    // xrAttachSessionActionSets, so the action space is usable. gazeSynced: our
+    // set has been part of at least one successful xrSyncActions.
+    XrActionSet gazeSet = XR_NULL_HANDLE;
+    XrAction    gazeAction = XR_NULL_HANDLE;
+    XrSpace     gazeSpace = XR_NULL_HANDLE;
+    bool gazeSupported = false;
+    bool gazeAttached = false;
+    bool gazeSynced = false;
+
+    // Client liveness, for eye gaze: a request left behind by a client that
+    // died must not keep the eye tracker running.
+    uint64_t lastHeartbeat = 0;
+    ULONGLONG lastHeartbeatTick = 0;
 };
+
+// Bindings the app itself suggested for the eye gaze profile. Suggesting a
+// profile again replaces the earlier suggestion, so ours has to carry theirs.
+static std::vector<XrActionSuggestedBinding> g_appEyeBindings;
 
 static std::mutex g_lock;
 static SessionState g_session;   // single-session layer (typical for overlays)
@@ -178,8 +219,14 @@ static void TryOpenControl(SessionState& s) {
     if (!h) return;
     // A client that predates the head-pose block created a smaller mapping;
     // fall back to the original size and just don't publish the pose.
+    // Likewise for eye gaze, which sits after the head pose.
     bool hasHeadPose = true;
+    bool hasEyeGaze = true;
     void* view = MapViewOfFile(h, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(MonoXrControlBlock));
+    if (!view) {
+        hasEyeGaze = false;
+        view = MapViewOfFile(h, FILE_MAP_ALL_ACCESS, 0, 0, offsetof(MonoXrControlBlock, eyeGaze));
+    }
     if (!view) {
         hasHeadPose = false;
         view = MapViewOfFile(h, FILE_MAP_ALL_ACCESS, 0, 0, offsetof(MonoXrControlBlock, headPose));
@@ -194,6 +241,7 @@ static void TryOpenControl(SessionState& s) {
     s.mapping = h;
     s.control = cb;
     s.controlHasHeadPose = hasHeadPose;
+    s.controlHasEyeGaze = hasEyeGaze;
     s.control->layerPid = GetCurrentProcessId();
     s.control->layerActive = 1;
     LogLine("attached to MonoXR control block, client pid=%u", cb->clientPid);
@@ -380,6 +428,65 @@ static void PublishHeadPose(SessionState& s, XrTime displayTime) {
     if (InterlockedIncrement(seq) == 0) InterlockedExchangeAdd(seq, 2); // 0 means "never published"
 }
 
+// True while the client is alive (its heartbeat moved within the last couple of
+// seconds) and has asked for eye gaze.
+static bool EyeGazeRequested(SessionState& s) {
+    if (!s.control || !s.controlHasEyeGaze || !s.control->eyeGaze.request) return false;
+    ULONGLONG now = GetTickCount64();
+    uint64_t hb = s.control->clientHeartbeat;
+    if (hb != s.lastHeartbeat) { s.lastHeartbeat = hb; s.lastHeartbeatTick = now; }
+    return now - s.lastHeartbeatTick < 2000;
+}
+
+// Publish the eye gaze ray (same seqlock as the head pose) and what the layer
+// knows about eye tracking. The tracker is only polled while the client has set
+// `request`; until then the state just says whether it could be.
+static void PublishEyeGaze(SessionState& s, XrTime displayTime) {
+    if (!s.controlHasEyeGaze) return;
+    MonoXrEyeGaze& g = s.control->eyeGaze;
+
+    uint32_t state = MONOXR_GAZE_UNSUPPORTED;
+    XrPosef pose{};
+    pose.orientation.w = 1.0f;
+
+    if (s.gazeSupported && s.gazeAttached) {
+        if (!EyeGazeRequested(s)) {
+            state = MONOXR_GAZE_IDLE;
+        } else {
+            state = MONOXR_GAZE_NO_SIGNAL;
+            if (s.gazeSynced && s.gazeSpace && s.worldSpace) {
+                XrActionStateGetInfo gi{ XR_TYPE_ACTION_STATE_GET_INFO };
+                gi.action = s.gazeAction;
+                XrActionStatePose st{ XR_TYPE_ACTION_STATE_POSE };
+                if (XR_SUCCEEDED(down_xrGetActionStatePose(s.session, &gi, &st)) && st.isActive) {
+                    XrSpaceLocation loc{ XR_TYPE_SPACE_LOCATION };
+                    const XrSpaceLocationFlags need = XR_SPACE_LOCATION_POSITION_VALID_BIT |
+                                                      XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
+                    if (XR_SUCCEEDED(down_xrLocateSpace(s.gazeSpace, s.worldSpace, displayTime, &loc)) &&
+                        (loc.locationFlags & need) == need) {
+                        pose = loc.pose;
+                        state = MONOXR_GAZE_TRACKING;
+                    }
+                }
+            }
+        }
+    }
+
+    volatile LONG* seq = reinterpret_cast<volatile LONG*>(&g.seq);
+    if (InterlockedIncrement(seq) % 2 == 0) InterlockedIncrement(seq); // resync to odd
+    g.state = state;
+    g.posX = pose.position.x; g.posY = pose.position.y; g.posZ = pose.position.z;
+    g.quatX = pose.orientation.x; g.quatY = pose.orientation.y;
+    g.quatZ = pose.orientation.z; g.quatW = pose.orientation.w;
+    if (InterlockedIncrement(seq) == 0) InterlockedExchangeAdd(seq, 2); // 0 means "never published"
+
+    static uint32_t lastState = ~0u;
+    if (state != lastState) {
+        lastState = state;
+        LogLine("eye gaze state -> %u (1 unsupported, 2 idle, 3 no signal, 4 tracking)", state);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Hooked entry points
 // ---------------------------------------------------------------------------
@@ -400,6 +507,7 @@ static XrResult XRAPI_CALL MonoXr_xrEndFrame(XrSession session, const XrFrameEnd
     s.control->layerPid = GetCurrentProcessId();
 
     PublishHeadPose(s, frameEndInfo->displayTime);
+    PublishEyeGaze(s, frameEndInfo->displayTime);
 
     // Storage must outlive the down-call; reserve so pointers stay stable.
     static std::vector<XrCompositionLayerQuad> quads;
@@ -473,6 +581,152 @@ static XrResult XRAPI_CALL MonoXr_xrEndFrame(XrSession session, const XrFrameEnd
     return efRes;
 }
 
+// Create the layer's gaze pose action and bind it to the eye gaze path. Done
+// per session, before the app can attach action sets (the session is brand
+// new), so the action is always eligible to go into the app's attach call.
+static void SetUpEyeGaze(SessionState& s, XrSystemId systemId) {
+    if (!g_eyeExtEnabled || !g_instance) return;
+
+    XrSystemEyeGazeInteractionPropertiesEXT eye{ XR_TYPE_SYSTEM_EYE_GAZE_INTERACTION_PROPERTIES_EXT };
+    XrSystemProperties props{ XR_TYPE_SYSTEM_PROPERTIES };
+    props.next = &eye;
+    if (XR_FAILED(down_xrGetSystemProperties(g_instance, systemId, &props)) ||
+        !eye.supportsEyeGazeInteraction) {
+        LogLine("eye gaze: system does not support eye gaze interaction");
+        return;
+    }
+
+    XrActionSetCreateInfo setInfo{ XR_TYPE_ACTION_SET_CREATE_INFO };
+    strcpy_s(setInfo.actionSetName, "monoxr_gaze");
+    strcpy_s(setInfo.localizedActionSetName, "MonoXR gaze");
+    XrResult r = down_xrCreateActionSet(g_instance, &setInfo, &s.gazeSet);
+    if (XR_FAILED(r)) { LogLine("eye gaze: xrCreateActionSet failed (%d)", r); s.gazeSet = XR_NULL_HANDLE; return; }
+
+    XrActionCreateInfo actInfo{ XR_TYPE_ACTION_CREATE_INFO };
+    actInfo.actionType = XR_ACTION_TYPE_POSE_INPUT;
+    strcpy_s(actInfo.actionName, "gaze");
+    strcpy_s(actInfo.localizedActionName, "Eye gaze");
+    r = down_xrCreateAction(s.gazeSet, &actInfo, &s.gazeAction);
+    if (XR_FAILED(r)) {
+        LogLine("eye gaze: xrCreateAction failed (%d)", r);
+        down_xrDestroyActionSet(s.gazeSet);
+        s.gazeSet = XR_NULL_HANDLE; s.gazeAction = XR_NULL_HANDLE;
+        return;
+    }
+
+    down_xrStringToPath(g_instance, "/interaction_profiles/ext/eye_gaze_interaction", &g_eyeProfilePath);
+    down_xrStringToPath(g_instance, "/user/eyes_ext/input/gaze_ext/pose", &g_eyeGazePosePath);
+
+    std::vector<XrActionSuggestedBinding> bindings = g_appEyeBindings;
+    bindings.push_back({ s.gazeAction, g_eyeGazePosePath });
+    XrInteractionProfileSuggestedBinding sug{ XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING };
+    sug.interactionProfile = g_eyeProfilePath;
+    sug.countSuggestedBindings = (uint32_t)bindings.size();
+    sug.suggestedBindings = bindings.data();
+    r = down_xrSuggestInteractionProfileBindings(g_instance, &sug);
+    if (XR_FAILED(r)) {
+        LogLine("eye gaze: suggesting bindings failed (%d)", r);
+        down_xrDestroyAction(s.gazeAction);
+        down_xrDestroyActionSet(s.gazeSet);
+        s.gazeSet = XR_NULL_HANDLE; s.gazeAction = XR_NULL_HANDLE;
+        return;
+    }
+
+    s.gazeSupported = true;
+    LogLine("eye gaze: supported; gaze action ready");
+}
+
+// The app records its action sets itself; ours has to ride along or it never
+// gets attached (a session takes exactly one attach call).
+static XrResult XRAPI_CALL MonoXr_xrAttachSessionActionSets(XrSession session,
+                                                            const XrSessionActionSetsAttachInfo* info) {
+    XrActionSet extra = XR_NULL_HANDLE;
+    {
+        std::lock_guard<std::mutex> guard(g_lock);
+        if (g_session.session == session && g_session.gazeSupported && !g_session.gazeAttached)
+            extra = g_session.gazeSet;
+    }
+    if (!extra || !info) return down_xrAttachSessionActionSets(session, info);
+
+    std::vector<XrActionSet> sets(info->actionSets, info->actionSets + info->countActionSets);
+    sets.push_back(extra);
+    XrSessionActionSetsAttachInfo patched = *info;
+    patched.countActionSets = (uint32_t)sets.size();
+    patched.actionSets = sets.data();
+    XrResult res = down_xrAttachSessionActionSets(session, &patched);
+    if (XR_FAILED(res)) return res;
+
+    std::lock_guard<std::mutex> guard(g_lock);
+    SessionState& s = g_session;
+    if (s.session == session) {
+        XrActionSpaceCreateInfo sp{ XR_TYPE_ACTION_SPACE_CREATE_INFO };
+        sp.action = s.gazeAction;
+        sp.poseInActionSpace.orientation.w = 1.0f;
+        XrResult sr = down_xrCreateActionSpace(session, &sp, &s.gazeSpace);
+        s.gazeAttached = XR_SUCCEEDED(sr);
+        LogLine("eye gaze: action set attached; action space %s (%d)", s.gazeAttached ? "ok" : "FAILED", sr);
+    }
+    return res;
+}
+
+// Poll the eye tracker only while the client wants it.
+static XrResult XRAPI_CALL MonoXr_xrSyncActions(XrSession session, const XrActionsSyncInfo* syncInfo) {
+    XrActionSet extra = XR_NULL_HANDLE;
+    {
+        std::lock_guard<std::mutex> guard(g_lock);
+        SessionState& s = g_session;
+        if (s.session == session && s.gazeAttached && EyeGazeRequested(s))
+            extra = s.gazeSet;
+    }
+    if (!extra || !syncInfo) return down_xrSyncActions(session, syncInfo);
+
+    std::vector<XrActiveActionSet> sets(syncInfo->activeActionSets,
+                                        syncInfo->activeActionSets + syncInfo->countActiveActionSets);
+    sets.push_back({ extra, XR_NULL_PATH });
+    XrActionsSyncInfo patched = *syncInfo;
+    patched.countActiveActionSets = (uint32_t)sets.size();
+    patched.activeActionSets = sets.data();
+    XrResult res = down_xrSyncActions(session, &patched);
+    if (XR_SUCCEEDED(res)) {
+        std::lock_guard<std::mutex> guard(g_lock);
+        if (g_session.session == session) g_session.gazeSynced = true;
+    }
+    return res;
+}
+
+// If the app binds the eye gaze profile itself, ours must be included or the
+// app's call would replace the layer's binding.
+static XrResult XRAPI_CALL MonoXr_xrSuggestInteractionProfileBindings(
+        XrInstance instance, const XrInteractionProfileSuggestedBinding* suggested) {
+    if (!suggested || !g_eyeExtEnabled || !down_xrStringToPath)
+        return down_xrSuggestInteractionProfileBindings(instance, suggested);
+
+    XrPath eyeProfile = XR_NULL_PATH;
+    down_xrStringToPath(instance, "/interaction_profiles/ext/eye_gaze_interaction", &eyeProfile);
+    if (eyeProfile == XR_NULL_PATH || suggested->interactionProfile != eyeProfile)
+        return down_xrSuggestInteractionProfileBindings(instance, suggested);
+
+    std::vector<XrActionSuggestedBinding> bindings(
+        suggested->suggestedBindings, suggested->suggestedBindings + suggested->countSuggestedBindings);
+    XrAction ours = XR_NULL_HANDLE;
+    XrPath oursPath = XR_NULL_PATH;
+    {
+        std::lock_guard<std::mutex> guard(g_lock);
+        g_appEyeBindings = bindings;   // kept for a session created after this call
+        if (g_session.gazeSupported && !g_session.gazeAttached) {
+            ours = g_session.gazeAction;
+            oursPath = g_eyeGazePosePath;
+        }
+    }
+    if (!ours) return down_xrSuggestInteractionProfileBindings(instance, suggested);
+
+    bindings.push_back({ ours, oursPath });
+    XrInteractionProfileSuggestedBinding patched = *suggested;
+    patched.countSuggestedBindings = (uint32_t)bindings.size();
+    patched.suggestedBindings = bindings.data();
+    return down_xrSuggestInteractionProfileBindings(instance, &patched);
+}
+
 static XrResult XRAPI_CALL MonoXr_xrCreateSession(XrInstance instance,
                                                   const XrSessionCreateInfo* createInfo,
                                                   XrSession* session) {
@@ -513,6 +767,8 @@ static XrResult XRAPI_CALL MonoXr_xrCreateSession(XrInstance instance,
     rs.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
     down_xrCreateReferenceSpace(*session, &rs, &s.headSpace);
 
+    SetUpEyeGaze(s, createInfo->systemId);
+
     TryOpenControl(s);
     return res;
 }
@@ -527,6 +783,9 @@ static XrResult XRAPI_CALL MonoXr_xrDestroySession(XrSession session) {
         }
         if (s.worldSpace) down_xrDestroySpace(s.worldSpace);
         if (s.headSpace) down_xrDestroySpace(s.headSpace);
+        if (s.gazeSpace) down_xrDestroySpace(s.gazeSpace);
+        if (s.gazeAction) down_xrDestroyAction(s.gazeAction);
+        if (s.gazeSet) down_xrDestroyActionSet(s.gazeSet);
         if (s.context) s.context->Release();
         CloseControl(s);
         s = SessionState{};
@@ -557,6 +816,11 @@ static XrResult XRAPI_CALL MonoXr_xrGetInstanceProcAddr(XrInstance instance, con
     if (strcmp(name, "xrCreateSession") == 0)  return give((void*)MonoXr_xrCreateSession);
     if (strcmp(name, "xrDestroySession") == 0) return give((void*)MonoXr_xrDestroySession);
     if (strcmp(name, "xrEndFrame") == 0)       return give((void*)MonoXr_xrEndFrame);
+    if (strcmp(name, "xrAttachSessionActionSets") == 0)
+        return give((void*)MonoXr_xrAttachSessionActionSets);
+    if (strcmp(name, "xrSyncActions") == 0)    return give((void*)MonoXr_xrSyncActions);
+    if (strcmp(name, "xrSuggestInteractionProfileBindings") == 0)
+        return give((void*)MonoXr_xrSuggestInteractionProfileBindings);
 
     if (g_nextGipa) return g_nextGipa(instance, name, function);
     *function = nullptr;
@@ -566,6 +830,20 @@ static XrResult XRAPI_CALL MonoXr_xrGetInstanceProcAddr(XrInstance instance, con
 // ---------------------------------------------------------------------------
 // Layer instance creation: descend the chain and resolve our dispatch table
 // ---------------------------------------------------------------------------
+static bool RuntimeHasExtension(PFN_xrGetInstanceProcAddr gipa, const char* name) {
+    PFN_xrEnumerateInstanceExtensionProperties enumExt = nullptr;
+    if (XR_FAILED(gipa(XR_NULL_HANDLE, "xrEnumerateInstanceExtensionProperties",
+                       reinterpret_cast<PFN_xrVoidFunction*>(&enumExt))) || !enumExt)
+        return false;
+    uint32_t count = 0;
+    if (XR_FAILED(enumExt(nullptr, 0, &count, nullptr)) || count == 0) return false;
+    std::vector<XrExtensionProperties> props(count, XrExtensionProperties{ XR_TYPE_EXTENSION_PROPERTIES });
+    if (XR_FAILED(enumExt(nullptr, count, &count, props.data()))) return false;
+    for (uint32_t i = 0; i < count; ++i)
+        if (strcmp(props[i].extensionName, name) == 0) return true;
+    return false;
+}
+
 static XrResult XRAPI_CALL MonoXr_xrCreateApiLayerInstance(const XrInstanceCreateInfo* info,
                                                            const XrApiLayerCreateInfo* apiLayerInfo,
                                                            XrInstance* instance) {
@@ -582,11 +860,40 @@ static XrResult XRAPI_CALL MonoXr_xrCreateApiLayerInstance(const XrInstanceCreat
     XrApiLayerCreateInfo local = *apiLayerInfo;
     local.nextInfo = apiLayerInfo->nextInfo->next; // advance to the next layer
 
-    XrResult res = nextCreate(info, &local, instance);
-    LogLine("  chained nextCreateApiLayerInstance returned %d", res);
+    // Turn on XR_EXT_eye_gaze_interaction for the app if the runtime has it and
+    // the app has not asked for it: the app never has to know, the layer reads
+    // the gaze itself. If the runtime refuses the extra extension, create the
+    // instance exactly as the app asked.
+    bool appHasEye = false;
+    for (uint32_t i = 0; info && i < info->enabledExtensionCount; ++i)
+        if (strcmp(info->enabledExtensionNames[i], XR_EXT_EYE_GAZE_INTERACTION_EXTENSION_NAME) == 0) appHasEye = true;
+
+    XrResult res = XR_ERROR_INITIALIZATION_FAILED;
+    bool eyeEnabled = false;
+    if (!appHasEye && info && RuntimeHasExtension(nextGipa, XR_EXT_EYE_GAZE_INTERACTION_EXTENSION_NAME)) {
+        std::vector<const char*> names(info->enabledExtensionNames,
+                                       info->enabledExtensionNames + info->enabledExtensionCount);
+        names.push_back(XR_EXT_EYE_GAZE_INTERACTION_EXTENSION_NAME);
+        XrInstanceCreateInfo patched = *info;
+        patched.enabledExtensionCount = (uint32_t)names.size();
+        patched.enabledExtensionNames = names.data();
+        res = nextCreate(&patched, &local, instance);
+        LogLine("  created instance with XR_EXT_eye_gaze_interaction added: %d", res);
+        eyeEnabled = XR_SUCCEEDED(res);
+    }
+    if (!eyeEnabled) {
+        local = *apiLayerInfo;
+        local.nextInfo = apiLayerInfo->nextInfo->next;
+        res = nextCreate(info, &local, instance);
+        eyeEnabled = appHasEye && XR_SUCCEEDED(res);
+    }
+    LogLine("  chained nextCreateApiLayerInstance returned %d (eye gaze ext %s)", res,
+            eyeEnabled ? "on" : "off");
     if (XR_FAILED(res)) return res;
 
     g_nextGipa = nextGipa;
+    g_instance = *instance;
+    g_eyeExtEnabled = eyeEnabled;
 
     #define RESOLVE(fn) nextGipa(*instance, #fn, (PFN_xrVoidFunction*)&down_##fn)
     RESOLVE(xrCreateSession);
@@ -602,6 +909,17 @@ static XrResult XRAPI_CALL MonoXr_xrCreateApiLayerInstance(const XrInstanceCreat
     RESOLVE(xrAcquireSwapchainImage);
     RESOLVE(xrWaitSwapchainImage);
     RESOLVE(xrReleaseSwapchainImage);
+    RESOLVE(xrGetSystemProperties);
+    RESOLVE(xrStringToPath);
+    RESOLVE(xrCreateActionSet);
+    RESOLVE(xrDestroyActionSet);
+    RESOLVE(xrCreateAction);
+    RESOLVE(xrDestroyAction);
+    RESOLVE(xrSuggestInteractionProfileBindings);
+    RESOLVE(xrAttachSessionActionSets);
+    RESOLVE(xrSyncActions);
+    RESOLVE(xrCreateActionSpace);
+    RESOLVE(xrGetActionStatePose);
     #undef RESOLVE
 
     LogLine("xrCreateApiLayerInstance ok; endFrame=%p session=%p",

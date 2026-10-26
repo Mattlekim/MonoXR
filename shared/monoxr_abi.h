@@ -69,6 +69,29 @@ struct MonoXrHeadPose {
     uint32_t _pad1;
 };
 
+// What the layer knows about eye tracking (MonoXrEyeGaze.state).
+enum MonoXrGazeState {
+    MONOXR_GAZE_UNKNOWN     = 0,  // layer has not published yet (also: layer predates this block)
+    MONOXR_GAZE_UNSUPPORTED = 1,  // runtime or headset has no XR_EXT_eye_gaze_interaction
+    MONOXR_GAZE_IDLE        = 2,  // supported, but the client has not asked for it (tracker not polled)
+    MONOXR_GAZE_NO_SIGNAL   = 3,  // asked for, but no usable gaze this frame (eyes lost, not calibrated)
+    MONOXR_GAZE_TRACKING    = 4,  // pose below is a live eye gaze ray
+};
+
+// Eye gaze in WORLD (LOCAL) space, from XR_EXT_eye_gaze_interaction. The ray
+// starts at pos and runs along the quaternion's -Z axis, exactly like the head
+// pose. Same seqlock as MonoXrHeadPose guards seq/state/pose. `request` is the
+// one field the client writes (1 = poll the eye tracker): the layer leaves the
+// tracker alone until it is asked, so nothing reads the user's eyes unless the
+// app is actually using them.
+struct MonoXrEyeGaze {
+    uint32_t seq;
+    uint32_t state;     // MonoXrGazeState
+    uint32_t request;   // client -> layer
+    float posX, posY, posZ;
+    float quatX, quatY, quatZ, quatW;
+};
+
 struct MonoXrControlBlock {
     uint32_t magic;         // MONOXR_MAGIC
     uint32_t version;       // MONOXR_VERSION
@@ -84,6 +107,10 @@ struct MonoXrControlBlock {
     // header/slot offsets are unchanged and a version-1 layer or client that
     // predates it keeps working — it simply never sees a head pose.
     struct MonoXrHeadPose headPose;
+
+    // After the head pose for the same reason: a layer or client without it
+    // maps the smaller block and simply never sees eye gaze.
+    struct MonoXrEyeGaze eyeGaze;
 };
 
 #pragma pack(pop)
@@ -95,7 +122,9 @@ static_assert(sizeof(MonoXrOverlaySlot) == 204, "MonoXrOverlaySlot must match Mo
 static_assert(sizeof(MonoXrHeadPose) == 40, "MonoXrHeadPose must match MonoXrAbi.cs HeadPoseSize");
 static_assert(offsetof(MonoXrControlBlock, slots) == 32, "header must match MonoXrAbi.cs HeaderSize");
 static_assert(offsetof(MonoXrControlBlock, headPose) == 3296, "headPose must match MonoXrAbi.cs HeadPoseOffset");
-static_assert(sizeof(MonoXrControlBlock) == 3336, "MonoXrControlBlock must match MonoXrAbi.cs ControlSize");
+static_assert(sizeof(MonoXrEyeGaze) == 40, "MonoXrEyeGaze must match MonoXrAbi.cs EyeGazeSize");
+static_assert(offsetof(MonoXrControlBlock, eyeGaze) == 3336, "eyeGaze must match MonoXrAbi.cs EyeGazeOffset");
+static_assert(sizeof(MonoXrControlBlock) == 3376, "MonoXrControlBlock must match MonoXrAbi.cs ControlSize");
 #endif
 
 // Keyed-mutex handshake on each shared texture:

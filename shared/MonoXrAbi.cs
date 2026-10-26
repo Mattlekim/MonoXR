@@ -3,7 +3,8 @@
 //   MonoXrOverlaySlot  = 204 bytes
 //   control header     = 32 bytes  (slots[] start at offset 32)
 //   MonoXrHeadPose     = 40 bytes  (after the slots, at offset 3296)
-//   full control block = 32 + 16*204 + 40 = 3336 bytes
+//   MonoXrEyeGaze      = 40 bytes  (after the head pose, at offset 3336)
+//   full control block = 32 + 16*204 + 40 + 40 = 3376 bytes
 using System.Runtime.InteropServices;
 
 namespace MonoXR.Shared;
@@ -20,7 +21,9 @@ public static class MonoXrConstants
     public const int HeaderSize = 32;
     public const int HeadPoseOffset = HeaderSize + MaxOverlays * SlotSize; // 3296
     public const int HeadPoseSize = 40;
-    public const int ControlSize = HeadPoseOffset + HeadPoseSize; // 3336
+    public const int EyeGazeOffset = HeadPoseOffset + HeadPoseSize; // 3336
+    public const int EyeGazeSize = 40;
+    public const int ControlSize = EyeGazeOffset + EyeGazeSize; // 3376
 
     // Keyed-mutex keys (see header).
     public const ulong KeyProducer = 0ul;
@@ -65,6 +68,28 @@ public struct MonoXrHeadPose
     public float PosX, PosY, PosZ;
     public float QuatX, QuatY, QuatZ, QuatW;
     public uint Pad1;
+}
+
+// What the layer knows about eye tracking.
+public enum MonoXrGazeState : uint
+{
+    Unknown = 0,     // never published (also: a layer build that predates eye gaze)
+    Unsupported = 1, // runtime or headset has no XR_EXT_eye_gaze_interaction
+    Idle = 2,        // supported, but not asked for (the tracker is not polled)
+    NoSignal = 3,    // asked for, but no usable gaze this frame
+    Tracking = 4,    // the pose is a live eye gaze ray
+}
+
+// Eye gaze in WORLD (LOCAL) space: a ray from Pos along the quaternion's -Z.
+// Seqlock on Seq (covers State and the pose). Request is written by the client.
+[StructLayout(LayoutKind.Sequential, Pack = 4)]
+public struct MonoXrEyeGaze
+{
+    public uint Seq;
+    public uint State;   // MonoXrGazeState
+    public uint Request; // client -> layer: 1 = poll the eye tracker
+    public float PosX, PosY, PosZ;
+    public float QuatX, QuatY, QuatZ, QuatW;
 }
 
 [StructLayout(LayoutKind.Sequential, Pack = 4)]
