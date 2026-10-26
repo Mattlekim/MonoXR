@@ -445,9 +445,10 @@ namespace MonoXR.Client
         // ----- Edit-mode per-target buttons ---------------------------------
         // Clicking a target in edit mode selects it (clicking empty canvas
         // clears the selection). Only the selected target gets its button
-        // bar — [Collapse|Expand] [Hide|Show], the opacity controls [-]
-        // [Opacity 100%] [+] (the percentage resets when clicked) and the
-        // optional Bind button — and its resize grip in the bottom-right
+        // bar — [Collapse|Expand] chevron, [Hide|Show], the opacity controls
+        // [-] [opacity icon + 100%] [+] (the percentage resets when clicked), the
+        // optional gaze (eye) toggle and the optional Bind button (a gamepad icon, followed by the bound
+        // button once there is one) — and its resize grip in the bottom-right
         // corner (drag it to scale the target). The bar sits just above the
         // target (or just inside it when the target touches the canvas top).
         // Hidden targets show in edit mode only as a name pill with a Show button
@@ -456,9 +457,9 @@ namespace MonoXR.Client
         private const int EditBtnHeight = 40;
         private const int EditBtnGap = 8;
         private const int EditStepBtnWidth = 48;   // [-] and [+]
-        private const int EditOpacityBtnWidth = 150; // "Opacity 100%"
+        private const int EditIconBtnWidth = 64;    // Collapse / Expand chevron, Bind gamepad, gaze eye
+        private const int EditOpacityBtnWidth = 130; // opacity icon + "100%"
         private const float EditOpacityStep = 0.1f;
-        private const int EditBindBtnWidth = 210;    // "Bind: B5+B12"
         private const int EditShowBtnWidth = 230;    // "Show: In car"
         private const int ResizeGripSize = 30;
 
@@ -606,6 +607,18 @@ namespace MonoXR.Client
 
         /// <summary>Raised when a target's edit-mode Show button is clicked (see <see cref="ShowButtonLabel"/>).</summary>
         public event Action<OverlayRenderTarget>? ShowModeCycleRequested;
+
+        /// <summary>
+        /// Optional: adds an eye-icon toggle to the edit-mode button bar for
+        /// choosing whether a target reacts to being looked at. Returns whether
+        /// it currently does (icon lit) or not (icon struck through). The host
+        /// only draws it; clicking raises <see cref="GazeToggleRequested"/> and
+        /// the app flips its own setting. Called every composed edit-mode frame.
+        /// </summary>
+        public Func<OverlayRenderTarget, bool>? GazeButtonState { get; set; }
+
+        /// <summary>Raised when a target's edit-mode gaze (eye) button is clicked (see <see cref="GazeButtonState"/>).</summary>
+        public event Action<OverlayRenderTarget>? GazeToggleRequested;
 
         /// <summary>
         /// Raised after the user changes a target's state in edit mode (Collapse /
@@ -1134,17 +1147,20 @@ namespace MonoXR.Client
         /// </summary>
         private (XnaRectangle Collapse, XnaRectangle Hide,
                  XnaRectangle Fainter, XnaRectangle OpacityReset, XnaRectangle Stronger,
-                 XnaRectangle Bind, XnaRectangle Show)
+                 XnaRectangle Gaze, XnaRectangle Bind, XnaRectangle Show)
             GetEditButtons(OverlayRenderTarget rt)
         {
             int by = rt.Y - EditBtnHeight - 6;
             if (by < 0) by = rt.Y + 6; // target touches the canvas top: bar goes inside
             bool hasState = !rt.EditModeOnly;
+            bool hasGaze = GazeButtonState != null && !rt.EditModeOnly;
             bool hasBind = BindButtonLabel != null && !rt.EditModeOnly;
             bool hasShow = ShowButtonLabel != null && !rt.EditModeOnly;
-            int barW = (hasState ? (EditBtnWidth + EditBtnGap) * 2 : 0)
+            int bindW = hasBind ? GetBindButtonWidth(rt) : 0;
+            int barW = (hasState ? EditIconBtnWidth + EditBtnWidth + EditBtnGap * 2 : 0)
                      + EditStepBtnWidth * 2 + EditOpacityBtnWidth + EditBtnGap * 2
-                     + (hasBind ? EditBindBtnWidth + EditBtnGap : 0)
+                     + (hasGaze ? EditIconBtnWidth + EditBtnGap : 0)
+                     + (hasBind ? bindW + EditBtnGap : 0)
                      + (hasShow ? EditShowBtnWidth + EditBtnGap : 0);
             int bx = Math.Clamp(rt.X, 0, Math.Max(0, CanvasWidth - barW));
 
@@ -1156,11 +1172,34 @@ namespace MonoXR.Client
             }
             // Tuple elements are evaluated left to right, so Next() lays the
             // bar out in the order the buttons are drawn.
-            return (hasState ? Next(EditBtnWidth) : XnaRectangle.Empty,
+            return (hasState ? Next(EditIconBtnWidth) : XnaRectangle.Empty,
                     hasState ? Next(EditBtnWidth) : XnaRectangle.Empty,
                     Next(EditStepBtnWidth), Next(EditOpacityBtnWidth), Next(EditStepBtnWidth),
-                    hasBind ? Next(EditBindBtnWidth) : XnaRectangle.Empty,
+                    hasGaze ? Next(EditIconBtnWidth) : XnaRectangle.Empty,
+                    hasBind ? Next(bindW) : XnaRectangle.Empty,
                     hasShow ? Next(EditShowBtnWidth) : XnaRectangle.Empty);
+        }
+
+        /// <summary>
+        /// What the Bind button shows next to its gamepad icon: the bound
+        /// button(s) (or the capture prompt) from <see cref="BindButtonLabel"/>,
+        /// without its "Bind:" lead-in. Empty while nothing is bound, when the
+        /// icon says it all.
+        /// </summary>
+        private string GetBindButtonText(OverlayRenderTarget rt)
+        {
+            if (BindButtonLabel == null) return string.Empty;
+            var (label, active) = BindButtonLabel(rt);
+            if (!active) return string.Empty;
+            const string lead = "Bind:";
+            return label.StartsWith(lead, StringComparison.OrdinalIgnoreCase) ? label.Substring(lead.Length).Trim() : label;
+        }
+
+        private int GetBindButtonWidth(OverlayRenderTarget rt)
+        {
+            string text = GetBindButtonText(rt);
+            if (text.Length == 0 || EditFont == null) return EditIconBtnWidth;
+            return EditIconBtnWidth + (int)MathF.Ceiling(EditFont.MeasureString(text).X) + 24;
         }
 
         /// <summary>Resize grip: the bottom-right corner square of a target's displayed bounds.</summary>
@@ -1188,7 +1227,13 @@ namespace MonoXR.Client
             var rt = _selected;
             if (rt != null && rt.Visible)
             {
-                var (collapse, hide, fainter, opacityReset, stronger, bind, show) = GetEditButtons(rt);
+                var (collapse, hide, fainter, opacityReset, stronger, gaze, bind, show) = GetEditButtons(rt);
+                if (!gaze.IsEmpty && gaze.Contains(mx, my))
+                {
+                    GazeToggleRequested?.Invoke(rt);
+                    _canvasDirty = true;
+                    return true;
+                }
                 if (!bind.IsEmpty && bind.Contains(mx, my))
                 {
                     BindRequested?.Invoke(rt);
@@ -1503,12 +1548,49 @@ namespace MonoXR.Client
             }
         }
 
+        /// <summary>
+        /// Edit-mode outline of one shown target so its bounds are obvious: the
+        /// one being dragged/resized is highlighted, the selection is cyan. The
+        /// selected target also gets its resize grip (a diagonal "stair" in the
+        /// bottom-right corner, only where dragging it works).
+        /// </summary>
+        private void DrawEditOutline(OverlayRenderTarget rt)
+        {
+            _compositor.Begin(SpriteSortMode.Deferred, BlendState.AlphaBlend, SamplerState.PointClamp);
+            int dw = rt.DisplayWidth, dh = rt.DisplayHeight;
+            bool active = rt == _dragTarget || rt == _resizeTarget;
+            var c = active          ? XnaColor.Lime
+                  : rt == _selected ? XnaColor.Cyan
+                                    : XnaColor.Yellow;
+            _compositor.Draw(_whitePixel, new XnaRectangle(rt.X, rt.Y, dw, 2), c);
+            _compositor.Draw(_whitePixel, new XnaRectangle(rt.X, rt.Y + dh - 2, dw, 2), c);
+            _compositor.Draw(_whitePixel, new XnaRectangle(rt.X, rt.Y, 2, dh), c);
+            _compositor.Draw(_whitePixel, new XnaRectangle(rt.X + dw - 2, rt.Y, 2, dh), c);
+
+            if (rt == _selected && !rt.IsCollapsed)
+            {
+                var grip = GetResizeGrip(rt);
+                const int bar = 5;
+                for (int i = 0; i * bar < grip.Width; i++)
+                {
+                    int len = Math.Min(grip.Width, (i + 1) * bar);
+                    _compositor.Draw(_whitePixel,
+                        new XnaRectangle(grip.Right - len, grip.Y + i * bar, len, Math.Min(bar, grip.Bottom - (grip.Y + i * bar))), c);
+                }
+            }
+            _compositor.End();
+        }
+
         /// <summary>Composite every target (and the edit-mode chrome) onto the bound, cleared canvas.</summary>
         private void ComposeTargets()
         {
             // Linear sampling: identical to point sampling for targets at 100%
             // (integer positions, 1:1 texels) and smooth for resized ones.
-            _compositor.Begin(SpriteSortMode.Deferred, BlendState.AlphaBlend, SamplerState.LinearClamp);
+            //
+            // In edit mode each target's outline and resize grip are drawn
+            // right after its own content, not in a pass over all targets
+            // afterwards: otherwise a lower target's outline would be painted
+            // across the selected (topmost) one.
             foreach (var rt in _targets)
             {
                 if (!rt.Visible) continue;
@@ -1517,11 +1599,14 @@ namespace MonoXR.Client
                 // region (the subclass draws the bar there when collapsed).
                 // The source region is stretched to the Scale-d display size.
                 var src = new XnaRectangle(0, 0, rt.SourceWidth, rt.SourceHeight);
+                _compositor.Begin(SpriteSortMode.Deferred, BlendState.AlphaBlend, SamplerState.LinearClamp);
                 _compositor.Draw(rt.Target,
                     new XnaRectangle(rt.X, rt.Y, rt.DisplayWidth, rt.DisplayHeight),
                     src, XnaColor.White * rt.Opacity);
+                _compositor.End();
+
+                if (EditMode) DrawEditOutline(rt);
             }
-            _compositor.End();
             if (EditMode)
             {
                 // Separate alpha-blended batch: button label glyphs need real
@@ -1534,38 +1619,6 @@ namespace MonoXR.Client
                 _compositor.Draw(_whitePixel, new XnaRectangle(0, h - t, w, t), XnaColor.Red);
                 _compositor.Draw(_whitePixel, new XnaRectangle(0, t, t, h - 2 * t), XnaColor.Red);
                 _compositor.Draw(_whitePixel, new XnaRectangle(w - t, t, t, h - 2 * t), XnaColor.Red);
-
-                // Outline each target so its bounds are obvious; the one being
-                // dragged/resized is highlighted, the selection is cyan and
-                // hidden targets get a pill instead.
-                foreach (var rt in _targets)
-                {
-                    if (rt.EditHidden || !rt.Visible) continue; // hidden ones get a pill below
-                    int dw = rt.DisplayWidth, dh = rt.DisplayHeight;
-                    bool active = rt == _dragTarget || rt == _resizeTarget;
-                    var c = active          ? XnaColor.Lime
-                          : rt == _selected ? XnaColor.Cyan
-                                            : XnaColor.Yellow;
-                    _compositor.Draw(_whitePixel, new XnaRectangle(rt.X, rt.Y, dw, 2), c);
-                    _compositor.Draw(_whitePixel, new XnaRectangle(rt.X, rt.Y + dh - 2, dw, 2), c);
-                    _compositor.Draw(_whitePixel, new XnaRectangle(rt.X, rt.Y, 2, dh), c);
-                    _compositor.Draw(_whitePixel, new XnaRectangle(rt.X + dw - 2, rt.Y, 2, dh), c);
-
-                    // Resize grip: diagonal "stair" in the bottom-right corner
-                    // (only where dragging it works — the selected target,
-                    // shown and expanded).
-                    if (rt == _selected && rt.Visible && !rt.IsCollapsed)
-                    {
-                        var grip = GetResizeGrip(rt);
-                        const int bar = 5;
-                        for (int i = 0; i * bar < grip.Width; i++)
-                        {
-                            int len = Math.Min(grip.Width, (i + 1) * bar);
-                            _compositor.Draw(_whitePixel,
-                                new XnaRectangle(grip.Right - len, grip.Y + i * bar, len, Math.Min(bar, grip.Bottom - (grip.Y + i * bar))), c);
-                        }
-                    }
-                }
 
                 // Hidden targets: just their name and a Show button.
                 foreach (var rt in _targets)
@@ -1581,17 +1634,15 @@ namespace MonoXR.Client
                 if (_selected is { Visible: true } sel)
                 {
                     var rt = sel;
-                    var (collapse, hide, fainter, opacityReset, stronger, bind, show) = GetEditButtons(rt);
-                    if (!collapse.IsEmpty) DrawEditButton(collapse, rt.IsCollapsed ? "Expand" : "Collapse", rt.IsCollapsed);
+                    var (collapse, hide, fainter, opacityReset, stronger, gaze, bind, show) = GetEditButtons(rt);
+                    if (!collapse.IsEmpty) DrawCollapseButton(collapse, rt.IsCollapsed);
                     if (!hide.IsEmpty) DrawEditButton(hide, rt.Visible ? "Hide" : "Show", !rt.Visible);
                     DrawEditButton(fainter, "-", false);
-                    DrawEditButton(opacityReset, $"Opacity {MathF.Round(rt.Opacity * 100f):0}%", rt.Opacity < 1f);
+                    DrawOpacityButton(opacityReset, rt.Opacity);
                     DrawEditButton(stronger, "+", false);
+                    if (!gaze.IsEmpty && GazeButtonState != null) DrawGazeButton(gaze, GazeButtonState(rt));
                     if (!bind.IsEmpty && BindButtonLabel != null)
-                    {
-                        var (label, active) = BindButtonLabel(rt);
-                        DrawEditButton(bind, label, active);
-                    }
+                        DrawBindButton(bind, BindButtonLabel(rt).Active, GetBindButtonText(rt));
                     if (!show.IsEmpty && ShowButtonLabel != null)
                     {
                         var (label, active) = ShowButtonLabel(rt);
@@ -1718,11 +1769,7 @@ namespace MonoXR.Client
         /// </summary>
         private void DrawEditButton(XnaRectangle r, string label, bool active)
         {
-            var bg = active ? new XnaColor(90, 60, 140) : new XnaColor(40, 40, 60);
-            var edge = active ? XnaColor.MediumPurple : XnaColor.Yellow;
-            int radius = r.Height / 2;
-            MonoXRDraw.RoundedRect(_compositor, r, radius, bg);
-            MonoXRDraw.RoundedRectOutline(_compositor, r, radius, 2, edge);
+            DrawEditButtonFrame(r, active);
 
             if (EditFont != null)
             {
@@ -1741,6 +1788,112 @@ namespace MonoXR.Client
                 if (active || label == "+")
                     _compositor.Draw(_whitePixel, new XnaRectangle(cx - 1, cy - 8, 3, 16), XnaColor.White);
             }
+        }
+
+        /// <summary>The pill behind an edit-mode button; returns the fill colour, for icons that cut shapes out of it.</summary>
+        private XnaColor DrawEditButtonFrame(XnaRectangle r, bool active)
+        {
+            var bg = active ? new XnaColor(90, 60, 140) : new XnaColor(40, 40, 60);
+            var edge = active ? XnaColor.MediumPurple : XnaColor.Yellow;
+            int radius = r.Height / 2;
+            MonoXRDraw.RoundedRect(_compositor, r, radius, bg);
+            MonoXRDraw.RoundedRectOutline(_compositor, r, radius, 2, edge);
+            return bg;
+        }
+
+        private void DrawButtonText(XnaRectangle area, string text, bool centerHorizontally)
+        {
+            if (EditFont == null || text.Length == 0) return;
+            var size = EditFont.MeasureString(text);
+            int x = centerHorizontally ? area.X + (int)((area.Width - size.X) / 2) : area.X;
+            _compositor.DrawString(EditFont, text,
+                new XnaVector2(x, area.Y + (int)((area.Height - size.Y) / 2)), XnaColor.White);
+        }
+
+        /// <summary>Collapse button: a chevron pointing up (click to collapse) or, once collapsed, down (click to expand).</summary>
+        private void DrawCollapseButton(XnaRectangle r, bool collapsed)
+        {
+            DrawEditButtonFrame(r, collapsed);
+            float cx = r.X + r.Width / 2f, cy = r.Y + r.Height / 2f;
+            float dy = collapsed ? -5f : 5f; // arms sit below the tip when pointing up
+            var tip = new XnaVector2(cx, cy - dy);
+            DrawLine(tip, new XnaVector2(cx - 10f, cy + dy), 4f, XnaColor.White);
+            DrawLine(tip, new XnaVector2(cx + 10f, cy + dy), 4f, XnaColor.White);
+        }
+
+        /// <summary>Gaze button: an eye, lit while the target reacts to being looked at and struck through when it does not.</summary>
+        private void DrawGazeButton(XnaRectangle r, bool enabled)
+        {
+            var bg = DrawEditButtonFrame(r, enabled);
+            int cx = r.X + r.Width / 2, cy = r.Y + r.Height / 2;
+            const int halfW = 16, halfH = 9;
+            for (int dx = -halfW; dx <= halfW; dx++)
+            {
+                float u = dx / (float)halfW;
+                int h = (int)MathF.Round(halfH * (1f - u * u));
+                _compositor.Draw(_whitePixel, new XnaRectangle(cx + dx, cy - h, 1, h * 2 + 1), XnaColor.White);
+            }
+            const int innerW = 13, innerH = 6;
+            for (int dx = -innerW; dx <= innerW; dx++)
+            {
+                float u = dx / (float)innerW;
+                int h = (int)MathF.Round(innerH * (1f - u * u));
+                _compositor.Draw(_whitePixel, new XnaRectangle(cx + dx, cy - h, 1, h * 2 + 1), bg);
+            }
+            const int pupil = 4;
+            for (int y = -pupil; y <= pupil; y++)
+            {
+                int w = (int)MathF.Round(MathF.Sqrt(pupil * pupil - y * y));
+                _compositor.Draw(_whitePixel, new XnaRectangle(cx - w, cy + y, w * 2 + 1, 1), XnaColor.White);
+            }
+            if (!enabled)
+            {
+                var a = new XnaVector2(cx - 15f, cy + 11f);
+                var b = new XnaVector2(cx + 15f, cy - 11f);
+                DrawLine(a, b, 7f, bg);
+                DrawLine(a, b, 3f, XnaColor.OrangeRed);
+            }
+        }
+
+        /// <summary>Opacity button: a half-filled disc followed by the current percentage.</summary>
+        private void DrawOpacityButton(XnaRectangle r, float opacity)
+        {
+            var bg = DrawEditButtonFrame(r, opacity < 1f);
+            const int radius = 11;
+            int cx = r.X + 14 + radius, cy = r.Y + r.Height / 2;
+            const int inner = radius - 2;
+            for (int y = -radius; y <= radius; y++)
+            {
+                int wo = (int)MathF.Round(MathF.Sqrt(radius * radius - y * y));
+                _compositor.Draw(_whitePixel, new XnaRectangle(cx - wo, cy + y, wo * 2, 1), XnaColor.White);
+                if (Math.Abs(y) > inner) continue;
+                int wi = (int)MathF.Round(MathF.Sqrt(inner * inner - y * y));
+                _compositor.Draw(_whitePixel, new XnaRectangle(cx - wi, cy + y, wi * 2, 1), bg);
+                _compositor.Draw(_whitePixel, new XnaRectangle(cx - wi, cy + y, wi, 1), XnaColor.White);
+            }
+            int textX = cx + radius + 10;
+            DrawButtonText(new XnaRectangle(textX, r.Y, r.Right - 14 - textX, r.Height),
+                           $"{MathF.Round(opacity * 100f):0}%", true);
+        }
+
+        /// <summary>Bind button: a gamepad icon, followed by the bound button(s) once there are any.</summary>
+        private void DrawBindButton(XnaRectangle r, bool active, string text)
+        {
+            var bg = DrawEditButtonFrame(r, active);
+            const int w = 32, h = 20;
+            var body = new XnaRectangle(r.X + (EditIconBtnWidth - w) / 2, r.Y + (r.Height - h) / 2, w, h);
+            MonoXRDraw.RoundedRect(_compositor, body, h / 2, XnaColor.White);
+
+            int cy = body.Y + h / 2;
+            int padX = body.X + 9;
+            _compositor.Draw(_whitePixel, new XnaRectangle(padX - 5, cy - 1, 11, 3), bg);   // d-pad
+            _compositor.Draw(_whitePixel, new XnaRectangle(padX - 1, cy - 5, 3, 11), bg);
+            _compositor.Draw(_whitePixel, new XnaRectangle(body.Right - 13, cy - 1, 5, 5), bg); // face buttons
+            _compositor.Draw(_whitePixel, new XnaRectangle(body.Right - 8, cy - 5, 5, 5), bg);
+
+            if (text.Length > 0)
+                DrawButtonText(new XnaRectangle(r.X + EditIconBtnWidth - 4, r.Y, r.Width - EditIconBtnWidth - 8, r.Height),
+                               text, false);
         }
 
         /// <summary>A label-only pill (a hidden target's name in edit mode); must be inside an alpha-blend batch.</summary>
