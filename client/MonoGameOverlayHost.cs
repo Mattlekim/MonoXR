@@ -415,8 +415,8 @@ namespace MonoXR.Client
         // optional Bind button — and its resize grip in the bottom-right
         // corner (drag it to scale the target). The bar sits just above the
         // target (or just inside it when the target touches the canvas top).
-        // Hidden targets are drawn as a faint ghost at the very back of the
-        // canvas; clicking a ghost selects it so Show stays reachable.
+        // Hidden targets show in edit mode only as a name pill with a Show button
+        // (see GetHiddenPill); clicking the pill selects it, the button shows it.
         private const int EditBtnWidth = 130;
         private const int EditBtnHeight = 40;
         private const int EditBtnGap = 8;
@@ -571,6 +571,13 @@ namespace MonoXR.Client
 
         /// <summary>Raised when a target's edit-mode Show button is clicked (see <see cref="ShowButtonLabel"/>).</summary>
         public event Action<OverlayRenderTarget>? ShowModeCycleRequested;
+
+        /// <summary>
+        /// Raised after the user changes a target's state in edit mode (Collapse /
+        /// Expand, Hide, or Show on a hidden target's pill), so the app can
+        /// remember it. Not raised when the app sets <see cref="OverlayRenderTarget.State"/> itself.
+        /// </summary>
+        public event Action<OverlayRenderTarget>? StateChanged;
 
         /// <summary>
         /// Force the canvas to be re-composited and republished on the next
@@ -849,6 +856,8 @@ namespace MonoXR.Client
                 return;
             }
 
+            UpdateArrowNudge();
+
             if (!UpdateCursor()) return;
             int mx = _cursorX, my = _cursorY;
 
@@ -866,14 +875,17 @@ namespace MonoXR.Client
                     _lmbWasDown = lmb;
                     return;
                 }
-                if (!HandleEditButtonClick(mx, my))
+                if (!HandleHiddenShowClick(mx, my) && !HandleEditButtonClick(mx, my))
                 {
-                    var hit = HitTest(mx, my);
+                    // A hidden target's pill is drawn above every panel, so it
+                    // wins the click over a shown panel underneath it.
+                    var pillHit = HitTestHidden(mx, my);
+                    var hit = pillHit == null ? HitTest(mx, my) : null;
                     bool wasSelected = hit != null && hit == _selected;
 
-                    // Select what was clicked (a hidden target's ghost too,
-                    // so it can be shown again); empty canvas deselects.
-                    var select = hit ?? HitTestHidden(mx, my);
+                    // Select what was clicked (a hidden target's pill too,
+                    // so it can be moved or shown again); empty canvas deselects.
+                    var select = hit ?? pillHit;
                     if (select != _selected)
                     {
                         _selected = select;
@@ -903,6 +915,14 @@ namespace MonoXR.Client
                         _dragTarget = hit;
                         _dragOffsetX = mx - hit.X;
                         _dragOffsetY = my - hit.Y;
+                    }
+                    else if (select != null && !select.Visible)
+                    {
+                        // A hidden target drags by its name pill.
+                        var pill = GetHiddenPill(select).Pill;
+                        _dragTarget = select;
+                        _dragOffsetX = mx - pill.X;
+                        _dragOffsetY = my - pill.Y;
                     }
                 }
             }
@@ -948,6 +968,57 @@ namespace MonoXR.Client
             }
 
             _lmbWasDown = lmb;
+        }
+
+        private const int VK_SHIFT = 0x10, VK_LEFT = 0x25, VK_UP = 0x26, VK_RIGHT = 0x27, VK_DOWN = 0x28;
+        private static readonly TimeSpan NudgeFirstDelay = TimeSpan.FromMilliseconds(350);
+        private static readonly TimeSpan NudgeRepeat = TimeSpan.FromMilliseconds(35);
+
+        private bool _nudgeHeld;
+        private bool _nudgeMoved;
+        private TimeSpan _nudgeNextAt;
+        private OverlayRenderTarget? _nudgeTarget;
+
+        private static bool KeyDown(int vk) => (GetAsyncKeyState(vk) & 0x8000) != 0;
+
+        /// <summary>
+        /// Edit mode: the arrow keys move the selected target 1 px (10 with Shift),
+        /// repeating while held — for placing a panel more precisely than a mouse
+        /// drag allows. Polled like the mouse, so it works while the game has
+        /// focus. Raises <see cref="DragCompleted"/> once the keys are released, so
+        /// the app saves the new position like it does after a drag.
+        /// </summary>
+        private void UpdateArrowNudge()
+        {
+            var rt = _selected;
+            int dx = (KeyDown(VK_RIGHT) ? 1 : 0) - (KeyDown(VK_LEFT) ? 1 : 0);
+            int dy = (KeyDown(VK_DOWN) ? 1 : 0) - (KeyDown(VK_UP) ? 1 : 0);
+
+            bool busy = _dragTarget != null || _resizeTarget != null || _editCapture != null;
+            if (rt == null || busy || (dx == 0 && dy == 0))
+            {
+                if (_nudgeMoved && _nudgeTarget != null) DragCompleted?.Invoke(_nudgeTarget);
+                _nudgeHeld = false;
+                _nudgeMoved = false;
+                _nudgeTarget = null;
+                return;
+            }
+
+            var now = _inputClock.Elapsed;
+            if (_nudgeHeld && now < _nudgeNextAt) return;
+            _nudgeNextAt = now + (_nudgeHeld ? NudgeRepeat : NudgeFirstDelay);
+            _nudgeHeld = true;
+
+            int step = KeyDown(VK_SHIFT) ? 10 : 1;
+            int x = Math.Clamp(rt.X + dx * step, 0, Math.Max(0, CanvasWidth - rt.DisplayWidth));
+            int y = Math.Clamp(rt.Y + dy * step, 0, Math.Max(0, CanvasHeight - rt.DisplayHeight));
+            if (x == rt.X && y == rt.Y) return;
+
+            rt.X = x;
+            rt.Y = y;
+            _nudgeMoved = true;
+            _nudgeTarget = rt;
+            _canvasDirty = true;
         }
 
         /// <summary>
@@ -1080,7 +1151,7 @@ namespace MonoXR.Client
         private bool HandleEditButtonClick(int mx, int my)
         {
             var rt = _selected;
-            if (rt != null)
+            if (rt != null && rt.Visible)
             {
                 var (collapse, hide, fainter, opacityReset, stronger, bind, show) = GetEditButtons(rt);
                 if (!bind.IsEmpty && bind.Contains(mx, my))
@@ -1099,12 +1170,14 @@ namespace MonoXR.Client
                 {
                     rt.State = rt.IsCollapsed ? OverlayTargetState.Visible : OverlayTargetState.Collapsed;
                     _canvasDirty = true;
+                    StateChanged?.Invoke(rt);
                     return true;
                 }
                 if (!hide.IsEmpty && hide.Contains(mx, my))
                 {
                     rt.State = rt.Visible ? OverlayTargetState.Hidden : OverlayTargetState.Visible;
                     _canvasDirty = true;
+                    StateChanged?.Invoke(rt);
                     return true;
                 }
                 if (fainter.Contains(mx, my)) { SetOpacityFromButton(rt, rt.Opacity - EditOpacityStep); return true; }
@@ -1123,7 +1196,40 @@ namespace MonoXR.Client
             _targets.Add(target);
         }
 
-        /// <summary>Topmost hidden target (drawn as a ghost in edit mode) whose bounds contain the point.</summary>
+        /// <summary>
+        /// A hidden target in edit mode is just a name pill with a Show button
+        /// at its top-left corner (nothing of its content or button bar):
+        /// the pill's and button's rects, kept on the canvas.
+        /// </summary>
+        private (XnaRectangle Pill, XnaRectangle Show) GetHiddenPill(OverlayRenderTarget rt)
+        {
+            int nameW = EditFont != null ? (int)MathF.Ceiling(EditFont.MeasureString(rt.Name).X) + 40 : 160;
+            int totalW = nameW + EditBtnGap + EditBtnWidth;
+            int px = Math.Clamp(rt.X, 0, Math.Max(0, CanvasWidth - totalW));
+            int py = Math.Clamp(rt.Y, 0, Math.Max(0, CanvasHeight - EditBtnHeight));
+            return (new XnaRectangle(px, py, nameW, EditBtnHeight),
+                    new XnaRectangle(px + nameW + EditBtnGap, py, EditBtnWidth, EditBtnHeight));
+        }
+
+        /// <summary>A click on a hidden target's Show button shows it (and selects it). True when one was hit.</summary>
+        private bool HandleHiddenShowClick(int mx, int my)
+        {
+            for (int i = _targets.Count - 1; i >= 0; i--)
+            {
+                var rt = _targets[i];
+                if (rt.Visible || rt.IsSkipped(EditMode)) continue;
+                if (!GetHiddenPill(rt).Show.Contains(mx, my)) continue;
+                rt.State = OverlayTargetState.Visible;
+                _selected = rt;
+                BringToFront(rt);
+                _canvasDirty = true;
+                StateChanged?.Invoke(rt);
+                return true;
+            }
+            return false;
+        }
+
+        /// <summary>Topmost hidden target whose edit-mode name pill or Show button contains the point.</summary>
         private OverlayRenderTarget? HitTestHidden(int mx, int my)
         {
             for (int i = _targets.Count - 1; i >= 0; i--)
@@ -1131,7 +1237,8 @@ namespace MonoXR.Client
                 var rt = _targets[i];
                 if (rt.Visible) continue;
                 if (rt.IsSkipped(EditMode)) continue;
-                if (mx >= rt.X && mx < rt.X + rt.DisplayWidth && my >= rt.Y && my < rt.Y + rt.DisplayHeight)
+                var (pill, show) = GetHiddenPill(rt);
+                if (pill.Contains(mx, my) || show.Contains(mx, my))
                     return rt;
             }
             return null;
@@ -1271,12 +1378,12 @@ namespace MonoXR.Client
             var gameTime = new GameTime(total, total - _lastTotal);
             _lastTotal = total;
 
-            // Hidden targets are completely dormant outside edit mode: no
-            // Update, no Render, and their dirty flag can't wake the canvas.
-            // In edit mode they stay live so the 10% ghost reflects reality.
+            // Hidden targets are completely dormant: no Update, no Render, and
+            // their dirty flag can't wake the canvas. In edit mode they show
+            // only as a name pill with a Show button, which needs none of that.
             foreach (var rt in _targets)
             {
-                if (!rt.Visible && !EditMode) continue;
+                if (!rt.Visible) continue;
                 if (rt.IsSkipped(EditMode)) continue;
                 rt.Update(gameTime);
             }
@@ -1288,7 +1395,7 @@ namespace MonoXR.Client
             bool anyDirty = _canvasDirty || (_calStep == 0 && EditToggleVisible != _editToggleShown);
             foreach (var rt in _targets)
             {
-                if (!rt.Visible && !EditMode) continue;
+                if (!rt.Visible) continue;
                 if (rt.IsSkipped(EditMode)) continue;
                 anyDirty |= rt.IsDirty;
             }
@@ -1301,11 +1408,11 @@ namespace MonoXR.Client
             // Only re-render targets that actually changed; clean targets keep
             // their existing texture and are just re-composited. A dormant
             // hidden target keeps its dirty flag, so it re-renders as soon as
-            // it is shown (or edit mode exposes its ghost).
+            // it is shown.
             foreach (var rt in _targets)
             {
                 if (!rt.IsDirty) continue;
-                if (!rt.Visible && !EditMode) continue;
+                if (!rt.Visible) continue;
                 if (rt.IsSkipped(EditMode)) continue;
                 GraphicsDevice.SetRenderTarget(rt.Target);
                 rt.Render(gameTime);
@@ -1367,19 +1474,6 @@ namespace MonoXR.Client
             // Linear sampling: identical to point sampling for targets at 100%
             // (integer positions, 1:1 texels) and smooth for resized ones.
             _compositor.Begin(SpriteSortMode.Deferred, BlendState.AlphaBlend, SamplerState.LinearClamp);
-            if (EditMode)
-            {
-                // Hidden targets: drawn first (behind everything) as a 10%-
-                // opacity ghost so they can still be located and shown again.
-                foreach (var rt in _targets)
-                {
-                    if (rt.Visible || rt.EditHidden) continue;
-                    var ghostSrc = new XnaRectangle(0, 0, rt.SourceWidth, rt.SourceHeight);
-                    _compositor.Draw(rt.Target,
-                        new XnaRectangle(rt.X, rt.Y, rt.DisplayWidth, rt.DisplayHeight),
-                        ghostSrc, XnaColor.White * 0.1f);
-                }
-            }
             foreach (var rt in _targets)
             {
                 if (!rt.Visible) continue;
@@ -1408,15 +1502,14 @@ namespace MonoXR.Client
 
                 // Outline each target so its bounds are obvious; the one being
                 // dragged/resized is highlighted, the selection is cyan and
-                // hidden ghosts get a dim outline.
+                // hidden targets get a pill instead.
                 foreach (var rt in _targets)
                 {
-                    if (rt.EditHidden) continue;
+                    if (rt.EditHidden || !rt.Visible) continue; // hidden ones get a pill below
                     int dw = rt.DisplayWidth, dh = rt.DisplayHeight;
                     bool active = rt == _dragTarget || rt == _resizeTarget;
                     var c = active          ? XnaColor.Lime
                           : rt == _selected ? XnaColor.Cyan
-                          : !rt.Visible     ? XnaColor.Gray * 0.5f
                                             : XnaColor.Yellow;
                     _compositor.Draw(_whitePixel, new XnaRectangle(rt.X, rt.Y, dw, 2), c);
                     _compositor.Draw(_whitePixel, new XnaRectangle(rt.X, rt.Y + dh - 2, dw, 2), c);
@@ -1439,10 +1532,18 @@ namespace MonoXR.Client
                     }
                 }
 
-                // Button bar for the selected target only (also when it is a
-                // hidden ghost, so Show stays reachable): Collapse / Hide,
-                // opacity, Bind.
-                if (_selected is { } sel)
+                // Hidden targets: just their name and a Show button.
+                foreach (var rt in _targets)
+                {
+                    if (rt.Visible || rt.IsSkipped(EditMode)) continue;
+                    var (pill, show) = GetHiddenPill(rt);
+                    DrawEditPill(pill, rt.Name, rt == _selected);
+                    DrawEditButton(show, "Show", false);
+                }
+
+                // Button bar for the selected, shown target only: Collapse /
+                // Hide, opacity, Bind, Show mode.
+                if (_selected is { Visible: true } sel)
                 {
                     var rt = sel;
                     var (collapse, hide, fainter, opacityReset, stronger, bind, show) = GetEditButtons(rt);
@@ -1604,6 +1705,21 @@ namespace MonoXR.Client
                 _compositor.Draw(_whitePixel, new XnaRectangle(cx - 8, cy - 1, 16, 3), XnaColor.White);
                 if (active || label == "+")
                     _compositor.Draw(_whitePixel, new XnaRectangle(cx - 1, cy - 8, 3, 16), XnaColor.White);
+            }
+        }
+
+        /// <summary>A label-only pill (a hidden target's name in edit mode); must be inside an alpha-blend batch.</summary>
+        private void DrawEditPill(XnaRectangle r, string label, bool selected)
+        {
+            int radius = r.Height / 2;
+            MonoXRDraw.RoundedRect(_compositor, r, radius, new XnaColor(40, 40, 60));
+            MonoXRDraw.RoundedRectOutline(_compositor, r, radius, 2, selected ? XnaColor.Cyan : XnaColor.Gray);
+            if (EditFont != null)
+            {
+                var size = EditFont.MeasureString(label);
+                _compositor.DrawString(EditFont, label,
+                    new XnaVector2(r.X + (int)((r.Width - size.X) / 2), r.Y + (int)((r.Height - size.Y) / 2)),
+                    XnaColor.White);
             }
         }
 
