@@ -103,6 +103,57 @@ namespace MonoXR.Client
             return _previewTarget;
         }
 
+        private SwapChainRenderTarget? _presentedTo;
+        private int _presentedVersion = -1;
+
+        /// <summary>
+        /// Draw the canvas (letterboxed, with the edit cursor) straight into a
+        /// swap chain bound to a window and present it — the desktop preview
+        /// path with no CPU readback: the canvas never leaves the GPU, unlike
+        /// <see cref="GetPreviewTexture"/> + GetData. Cheap to call every tick:
+        /// it only draws when the canvas or cursor changed, the swap chain is a
+        /// different one (e.g. recreated after a resize), or
+        /// <paramref name="force"/> (the window was exposed). Call from the
+        /// thread that calls <see cref="RenderFrame"/>, outside of it. Returns
+        /// true when a frame was presented.
+        /// </summary>
+        /// <param name="target">Swap chain sized to the window's client area.</param>
+        public bool PresentPreview(SwapChainRenderTarget target, bool force = false)
+        {
+            if (_disposed) return false;
+            if (!force && ReferenceEquals(_presentedTo, target) && _presentedVersion == PreviewVersion) return false;
+            _presentedTo = target;
+            _presentedVersion = PreviewVersion;
+
+            int cw = CanvasWidth, ch = CanvasHeight, tw = target.Width, th = target.Height;
+            float scale = Math.Min(tw / (float)cw, th / (float)ch);
+            int dw = Math.Max(1, (int)MathF.Round(cw * scale));
+            int dh = Math.Max(1, (int)MathF.Round(ch * scale));
+            int dx = (tw - dw) / 2, dy = (th - dh) / 2;
+
+            GraphicsDevice.SetRenderTarget(target);
+            // Dark backing so the canvas's transparent regions read as empty space.
+            GraphicsDevice.Clear(new XnaColor(0x0E, 0x0E, 0x1A));
+
+            // The canvas holds premultiplied alpha, same as when it is composed
+            // for VR: the default AlphaBlend lays it over the backing correctly.
+            _compositor.Begin(SpriteSortMode.Deferred, BlendState.AlphaBlend, SamplerState.LinearClamp);
+            _compositor.Draw(_canvasTarget, new XnaRectangle(dx, dy, dw, dh), XnaColor.White);
+            _compositor.End();
+
+            // The crosshair is a separate VR quad, not part of the canvas.
+            if (_calStep == 0)
+            {
+                _compositor.Begin(SpriteSortMode.Deferred, BlendState.AlphaBlend, SamplerState.PointClamp);
+                DrawCrosshair(dx + (int)(_cursorX * scale), dy + (int)(_cursorY * scale), 8, 2);
+                _compositor.End();
+            }
+
+            GraphicsDevice.SetRenderTarget(null);
+            target.Present();
+            return true;
+        }
+
         /// <summary>
         /// Bumped every time the canvas is recomposed. Lets a desktop preview
         /// skip the CPU readback on frames where dirty-flag rendering did no
@@ -827,6 +878,10 @@ namespace MonoXR.Client
                     {
                         _selected = select;
                         _canvasDirty = true;
+                        // Selecting a target raises it above the others: the
+                        // list order is the draw order, and hit-testing walks
+                        // it back to front.
+                        if (select != null) BringToFront(select);
                     }
 
                     // The corner grip (selected target only) wins over
@@ -1059,6 +1114,15 @@ namespace MonoXR.Client
             return false;
         }
 
+        /// <summary>Move a target to the end of the list so it is drawn (and hit) above every other.</summary>
+        private void BringToFront(OverlayRenderTarget target)
+        {
+            int i = _targets.IndexOf(target);
+            if (i < 0 || i == _targets.Count - 1) return;
+            _targets.RemoveAt(i);
+            _targets.Add(target);
+        }
+
         /// <summary>Topmost hidden target (drawn as a ghost in edit mode) whose bounds contain the point.</summary>
         private OverlayRenderTarget? HitTestHidden(int mx, int my)
         {
@@ -1066,7 +1130,7 @@ namespace MonoXR.Client
             {
                 var rt = _targets[i];
                 if (rt.Visible) continue;
-                if (!rt.IsLive && !EditMode) continue;
+                if (rt.IsSkipped(EditMode)) continue;
                 if (mx >= rt.X && mx < rt.X + rt.DisplayWidth && my >= rt.Y && my < rt.Y + rt.DisplayHeight)
                     return rt;
             }
@@ -1080,7 +1144,7 @@ namespace MonoXR.Client
             {
                 var rt = _targets[i];
                 if (!rt.Visible) continue;
-                if (!rt.IsLive && !EditMode) continue;
+                if (rt.IsSkipped(EditMode)) continue;
                 if (mx >= rt.X && mx < rt.X + rt.DisplayWidth && my >= rt.Y && my < rt.Y + rt.DisplayHeight)
                     return rt;
             }
@@ -1213,7 +1277,7 @@ namespace MonoXR.Client
             foreach (var rt in _targets)
             {
                 if (!rt.Visible && !EditMode) continue;
-                if (!rt.IsLive && !EditMode) continue;
+                if (rt.IsSkipped(EditMode)) continue;
                 rt.Update(gameTime);
             }
 
@@ -1225,7 +1289,7 @@ namespace MonoXR.Client
             foreach (var rt in _targets)
             {
                 if (!rt.Visible && !EditMode) continue;
-                if (!rt.IsLive && !EditMode) continue;
+                if (rt.IsSkipped(EditMode)) continue;
                 anyDirty |= rt.IsDirty;
             }
             if (!anyDirty)
@@ -1242,7 +1306,7 @@ namespace MonoXR.Client
             {
                 if (!rt.IsDirty) continue;
                 if (!rt.Visible && !EditMode) continue;
-                if (!rt.IsLive && !EditMode) continue;
+                if (rt.IsSkipped(EditMode)) continue;
                 GraphicsDevice.SetRenderTarget(rt.Target);
                 rt.Render(gameTime);
                 rt.ClearDirty();
@@ -1309,7 +1373,7 @@ namespace MonoXR.Client
                 // opacity ghost so they can still be located and shown again.
                 foreach (var rt in _targets)
                 {
-                    if (rt.Visible) continue;
+                    if (rt.Visible || rt.EditHidden) continue;
                     var ghostSrc = new XnaRectangle(0, 0, rt.SourceWidth, rt.SourceHeight);
                     _compositor.Draw(rt.Target,
                         new XnaRectangle(rt.X, rt.Y, rt.DisplayWidth, rt.DisplayHeight),
@@ -1319,7 +1383,7 @@ namespace MonoXR.Client
             foreach (var rt in _targets)
             {
                 if (!rt.Visible) continue;
-                if (!rt.IsLive && !EditMode) continue;
+                if (rt.IsSkipped(EditMode)) continue;
                 // Collapsed targets only contribute their top-left name-bar
                 // region (the subclass draws the bar there when collapsed).
                 // The source region is stretched to the Scale-d display size.
@@ -1347,6 +1411,7 @@ namespace MonoXR.Client
                 // hidden ghosts get a dim outline.
                 foreach (var rt in _targets)
                 {
+                    if (rt.EditHidden) continue;
                     int dw = rt.DisplayWidth, dh = rt.DisplayHeight;
                     bool active = rt == _dragTarget || rt == _resizeTarget;
                     var c = active          ? XnaColor.Lime

@@ -81,6 +81,28 @@ namespace MonoXR.Client
         /// <summary>True when this target takes part outside edit mode as things stand.</summary>
         public bool IsLive => _available && !EditModeOnly;
 
+        private bool _editHidden;
+
+        /// <summary>
+        /// App-controlled gate for edit mode: true leaves this target out
+        /// entirely while editing — not drawn, not outlined, not hit-tested, not
+        /// even as a hidden ghost. <see cref="Available"/> is ignored in edit
+        /// mode so panels can be found and placed; this is for a panel that does
+        /// not apply to the situation being edited (e.g. a replay-only panel
+        /// while arranging the in-car layout). Has no effect outside edit mode.
+        /// </summary>
+        public bool EditHidden
+        {
+            get => _editHidden;
+            set { if (_editHidden != value) { _editHidden = value; Invalidate(); } }
+        }
+
+        /// <summary>
+        /// True when this target takes no part right now: outside edit mode when
+        /// not <see cref="IsLive"/>, inside it when <see cref="EditHidden"/>.
+        /// </summary>
+        public bool IsSkipped(bool editMode) => editMode ? _editHidden : !IsLive;
+
         /// <summary>Hidden / Visible / Collapsed. Changing it re-renders and republishes.</summary>
         public OverlayTargetState State
         {
