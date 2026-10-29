@@ -923,7 +923,9 @@ namespace MonoXR.Client
             float pxPerMeter = DisplaySize.X > 0 ? CanvasWidth / DisplaySize.X : 768f;
             int size = Math.Max(48, (int)MathF.Round(0.08f * pxPerMeter));
             int margin = Math.Max(EditBorderThickness + 8, size / 4);
-            return new XnaRectangle(CanvasWidth - margin - size, margin, size, size);
+            // Below the top screen's band when there is one: the corner of the
+            // band is not shown on any screen.
+            return new XnaRectangle(CanvasWidth - margin - size, BandPx() + margin, size, size);
         }
 
         /// <summary>Press on the edit toggle flips edit mode. True when the press was consumed.</summary>
@@ -1777,13 +1779,15 @@ namespace MonoXR.Client
                 if (rt.State != OverlayTargetState.Visible) rt.State = OverlayTargetState.Visible;
 
                 // Shrink a panel that is too big for the canvas so it always fits.
-                float fit = MathF.Min(1f, MathF.Min((CanvasHeight - DockMargin) / (float)rt.Height,
+                // Centred on the screens below the top screen's band, not on the whole canvas.
+                int band = BandPx(), area = CanvasHeight - band;
+                float fit = MathF.Min(1f, MathF.Min((area - DockMargin) / (float)rt.Height,
                                                     (CanvasWidth - DockTabWidth - DockMargin) / (float)rt.Width));
                 rt.Scale = Math.Max(OverlayRenderTarget.MinScale, fit);
 
                 int w = rt.DisplayWidth, h = rt.DisplayHeight;
                 rt.X = rt.DockSide == OverlayDockSide.Right ? Math.Max(0, CanvasWidth - w) : 0;
-                rt.Y = Math.Max(0, (CanvasHeight - h) / 2);
+                rt.Y = band + Math.Max(0, (area - h) / 2);
             }
         }
 
@@ -1803,8 +1807,9 @@ namespace MonoXR.Client
 
         private XnaRectangle GetDockTab(OverlayRenderTarget rt)
         {
-            int h = Math.Min(DockTabHeight, CanvasHeight);
-            int y = (CanvasHeight - h) / 2;
+            int band = BandPx(), area = CanvasHeight - band; // centred below the top screen's band
+            int h = Math.Min(DockTabHeight, area);
+            int y = band + (area - h) / 2;
             int panel = rt.DockOpen ? rt.DisplayWidth : 0;
             int x = rt.DockSide == OverlayDockSide.Right ? CanvasWidth - panel - DockTabWidth : panel;
             return new XnaRectangle(x, y, DockTabWidth, h);
