@@ -39,6 +39,14 @@ public sealed unsafe class Overlay : IDisposable
     public bool Visible = true;
     public int ZOrder;
 
+    /// <summary>
+    /// 0 for a flat quad. Above 0 the overlay is bent onto a vertical cylinder of
+    /// this radius in meters, centred this far behind the quad's centre (along the
+    /// quad's own +Z); <see cref="Size"/> is then the arc length and height. Needs a
+    /// runtime with cylinder layers - without one the overlay stays flat.
+    /// </summary>
+    public float CurveRadius;
+
     public int Width => _width;
     public int Height => _height;
 
@@ -180,6 +188,7 @@ public sealed unsafe class Overlay : IDisposable
         slot->Visible = Visible ? 1u : 0u;
         slot->Space = (uint)Space;
         slot->ZOrder = ZOrder;
+        slot->CurveRadius = CurveRadius;
         slot->PosX = Position.X; slot->PosY = Position.Y; slot->PosZ = Position.Z;
         slot->QuatX = Rotation.X; slot->QuatY = Rotation.Y; slot->QuatZ = Rotation.Z; slot->QuatW = Rotation.W;
         slot->SizeX = Size.X; slot->SizeY = Size.Y;

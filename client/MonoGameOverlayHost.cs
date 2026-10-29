@@ -182,7 +182,8 @@ namespace MonoXR.Client
         /// <summary>
         /// Distance in meters from the view origin (see <see cref="SetOrigin"/>;
         /// the world origin until recentered) to the overlay. The quad stays
-        /// centered on that origin's look direction.
+        /// centered on that origin's look direction, shifted by
+        /// <see cref="OffsetX"/> / <see cref="OffsetY"/>.
         /// </summary>
         public float Distance
         {
@@ -191,6 +192,61 @@ namespace MonoXR.Client
         }
 
         private float _distance = 3f;
+
+        /// <summary>
+        /// Sideways shift in meters of the overlay from the view origin's look
+        /// direction, along the quad's own right axis (positive = to the right).
+        /// </summary>
+        public float OffsetX
+        {
+            get => _offsetX;
+            set { _offsetX = value; ApplyPose(); }
+        }
+
+        /// <summary>Vertical shift in meters along the quad's own up axis (positive = up).</summary>
+        public float OffsetY
+        {
+            get => _offsetY;
+            set { _offsetY = value; ApplyPose(); }
+        }
+
+        private float _offsetX, _offsetY;
+
+        /// <summary>
+        /// Bend the overlay onto a vertical cylinder around the view origin, so
+        /// it wraps around the user instead of standing flat. The radius is
+        /// <see cref="Distance"/> / <see cref="CurveAmount"/>, <see cref="DisplaySize"/>
+        /// is the arc length and height, and <see cref="OffsetX"/> then slides
+        /// the overlay around the cylinder (as an arc) rather than sideways.
+        /// Needs a runtime with cylinder layers; the OpenXR layer draws it flat
+        /// without one.
+        /// </summary>
+        public bool Curved
+        {
+            get => _curved;
+            set { _curved = value; ApplyPose(); }
+        }
+
+        private bool _curved;
+
+        /// <summary>
+        /// How strongly a <see cref="Curved"/> overlay bends, 0.1 to 1.5. 1 is
+        /// the cylinder around the view origin (every point of the overlay the
+        /// same distance away); less is a gentler curve (a wider cylinder), more
+        /// a tighter one.
+        /// </summary>
+        public float CurveAmount
+        {
+            get => _curveAmount;
+            set { _curveAmount = Math.Clamp(value, 0.1f, 1.5f); ApplyPose(); }
+        }
+
+        private float _curveAmount = 1f;
+
+        // Radius of the cylinder, and where its vertical axis sits: forward of
+        // the view origin by (distance - radius), so the surface is always
+        // _distance ahead at the overlay's centre line.
+        private float CurveRadius => _distance / _curveAmount;
 
         /// <summary>World-space point the overlay is placed in front of (the user's head when last recentered).</summary>
         public Vector3 OriginPosition { get; private set; }
@@ -243,8 +299,22 @@ namespace MonoXR.Client
         {
             // Yaw then pitch, no roll: forward = (-cos p * sin y, sin p, -cos p * cos y).
             var rotation = Quaternion.CreateFromYawPitchRoll(OriginYaw, OriginPitch, 0f);
-            _overlay.Rotation = rotation;
-            _overlay.Position = OriginPosition + Vector3.Transform(new Vector3(0f, 0f, -_distance), rotation);
+            if (_curved)
+            {
+                // Slide around the cylinder by the offset's arc length, facing the axis.
+                float radius = CurveRadius;
+                float angle = _offsetX / radius;
+                _overlay.Rotation = rotation * Quaternion.CreateFromAxisAngle(Vector3.UnitY, -angle);
+                _overlay.Position = OriginPosition + Vector3.Transform(
+                    new Vector3(radius * MathF.Sin(angle), _offsetY, radius - _distance - radius * MathF.Cos(angle)), rotation);
+                _overlay.CurveRadius = radius;
+            }
+            else
+            {
+                _overlay.Rotation = rotation;
+                _overlay.Position = OriginPosition + Vector3.Transform(new Vector3(_offsetX, _offsetY, -_distance), rotation);
+                _overlay.CurveRadius = 0f;
+            }
             _canvasDirty = true;
         }
 
@@ -315,7 +385,9 @@ namespace MonoXR.Client
             // _distance along the origin's look direction, its own +X to the
             // right, +Y up and +Z back out toward the user.
             var quad = Quaternion.CreateFromYawPitchRoll(OriginYaw, OriginPitch, 0f);
-            Vector3 center = OriginPosition + Vector3.Transform(new Vector3(0f, 0f, -_distance), quad);
+            if (_curved) return CanvasPointOfRayCurved(eye, head, quad, size, out x, out y);
+
+            Vector3 center = OriginPosition + Vector3.Transform(new Vector3(_offsetX, _offsetY, -_distance), quad);
             Vector3 right = Vector3.Transform(Vector3.UnitX, quad);
             Vector3 up = Vector3.Transform(Vector3.UnitY, quad);
             Vector3 normal = Vector3.Transform(Vector3.UnitZ, quad);
@@ -335,6 +407,46 @@ namespace MonoXR.Client
             Vector3 local = eye + look * t - center;
             x = (Vector3.Dot(local, right) / size.X + 0.5f) * CanvasWidth;
             y = (0.5f - Vector3.Dot(local, up) / size.Y) * CanvasHeight;
+            return float.IsFinite(x) && float.IsFinite(y);
+        }
+
+        // The same, for the curved overlay: intersect the ray with the cylinder
+        // (vertical axis in the origin's frame, see CurveRadius) and read the
+        // hit as arc length around it and height above its centre line.
+        private bool CanvasPointOfRayCurved(Vector3 eye, Quaternion head, Quaternion frame, Vector2 size,
+                                            out float x, out float y)
+        {
+            x = 0f;
+            y = 0f;
+
+            var inverse = Quaternion.Inverse(frame);
+            Vector3 look = Vector3.Transform(-Vector3.UnitZ, head);
+            float lookLen = look.Length();
+            if (!(lookLen > 1e-4f)) return false;
+            look = Vector3.Transform(look / lookLen, inverse);
+            Vector3 p = Vector3.Transform(eye - OriginPosition, inverse);
+            float radius = CurveRadius;
+            p.Y -= _offsetY;
+            p.Z += _distance - radius; // relative to the cylinder's axis
+
+            float a = look.X * look.X + look.Z * look.Z;
+            if (a < 1e-6f) return false; // looking straight up or down
+            float b = 2f * (p.X * look.X + p.Z * look.Z);
+            float c = p.X * p.X + p.Z * p.Z - radius * radius;
+            float disc = b * b - 4f * a * c;
+            if (disc < 0f) return false;
+
+            // From inside the cylinder the far root is the wall in front of the ray.
+            float t = (-b + MathF.Sqrt(disc)) / (2f * a);
+            if (t <= 0f) return false;
+
+            Vector3 hit = p + look * t;
+            float angle = MathF.Atan2(hit.X, -hit.Z) - _offsetX / radius; // from the overlay's centre line
+            if (angle > MathF.PI) angle -= 2f * MathF.PI;
+            else if (angle < -MathF.PI) angle += 2f * MathF.PI;
+
+            x = (angle * radius / size.X + 0.5f) * CanvasWidth;
+            y = (0.5f - hit.Y / size.Y) * CanvasHeight;
             return float.IsFinite(x) && float.IsFinite(y);
         }
 
@@ -373,7 +485,7 @@ namespace MonoXR.Client
                 if (_editMode == value) return;
                 _editMode = value;
                 _canvasDirty = true;
-                if (!value) _selected = null;
+                if (!value) { _selected = null; _group.Clear(); _marquee = false; _groupDrag = false; }
                 EditModeChanged?.Invoke(value);
                 // Let targets react (e.g. draw a placeholder while edited).
                 foreach (var rt in _targets)
@@ -460,7 +572,8 @@ namespace MonoXR.Client
         private const int EditIconBtnWidth = 64;    // Collapse / Expand chevron, Bind gamepad, gaze eye
         private const int EditOpacityBtnWidth = 130; // opacity icon + "100%"
         private const float EditOpacityStep = 0.1f;
-        private const int EditShowBtnWidth = 230;    // "Show: In car"
+        private const int EditShowChipPad = 28;      // text padding inside a Show chip
+        private const int EditShowChipGap = 4;
         private const int ResizeGripSize = 30;
 
         /// <summary>
@@ -547,6 +660,19 @@ namespace MonoXR.Client
         private OverlayRenderTarget? _resizeTarget; // target whose corner grip is being dragged
         private OverlayRenderTarget? _selected;     // edit-mode selection: shows its buttons + resize grip
 
+        // Edit-mode multi-selection, made by dragging a box over empty canvas (or
+        // Shift+click): two or more targets that move together. Empty while a single
+        // target (or none) is selected; then _selected is null, so no button bar.
+        private readonly List<OverlayRenderTarget> _group = new();
+        private bool _marquee;                       // a selection box is being dragged
+        private int _marqueeX0, _marqueeY0;          // where it started (canvas px)
+        private bool _groupDrag;                     // the group is being dragged
+        private int _groupPressX, _groupPressY;
+        private readonly Dictionary<OverlayRenderTarget, (int X, int Y)> _groupStart = new();
+
+        /// <summary>The targets selected together by drag-select or Shift+click (empty unless two or more).</summary>
+        public IReadOnlyList<OverlayRenderTarget> SelectedGroup => _group;
+
         /// <summary>The target selected in edit mode (null when none). Only it shows its buttons and resize grip.</summary>
         public OverlayRenderTarget? SelectedTarget => _selected;
 
@@ -595,18 +721,17 @@ namespace MonoXR.Client
         public event Action<OverlayRenderTarget>? BindRequested;
 
         /// <summary>
-        /// Optional: label and highlight for a per-target "Show" button at the
-        /// end of the edit-mode button bar, for choosing when a panel applies.
-        /// The host only draws it — what the choices mean is the app's
-        /// business, which it acts on through
-        /// <see cref="OverlayRenderTarget.Available"/>. Clicking it raises
-        /// <see cref="ShowModeCycleRequested"/>. Called every composed
+        /// Optional: a row of toggle chips at the end of the edit-mode button
+        /// bar, for choosing when a panel applies (any mix of choices). The host
+        /// only draws them — what they mean is the app's business, which it acts
+        /// on through <see cref="OverlayRenderTarget.Available"/>. Clicking chip
+        /// <c>i</c> raises <see cref="ShowChipClicked"/>. Called every composed
         /// edit-mode frame.
         /// </summary>
-        public Func<OverlayRenderTarget, (string Label, bool Active)>? ShowButtonLabel { get; set; }
+        public Func<OverlayRenderTarget, IReadOnlyList<(string Label, bool On)>>? ShowChips { get; set; }
 
-        /// <summary>Raised when a target's edit-mode Show button is clicked (see <see cref="ShowButtonLabel"/>).</summary>
-        public event Action<OverlayRenderTarget>? ShowModeCycleRequested;
+        /// <summary>Raised when chip <c>index</c> of a target's <see cref="ShowChips"/> is clicked.</summary>
+        public event Action<OverlayRenderTarget, int>? ShowChipClicked;
 
         /// <summary>
         /// Optional: adds an eye-icon toggle to the edit-mode button bar for
@@ -766,6 +891,7 @@ namespace MonoXR.Client
             _calStep = 1;
             _calWaitRelease = true;
             _dragTarget = null; _editCapture = null; _resizeTarget = null; _selected = null;
+            _group.Clear(); _marquee = false; _groupDrag = false;
             _canvasDirty = true;
             return true;
         }
@@ -854,6 +980,8 @@ namespace MonoXR.Client
         {
             if (!EditMode)
             {
+                if (_groupDrag) EndGroupDrag();
+                _marquee = false;
                 if (_dragTarget != null)
                 {
                     var done = _dragTarget;
@@ -931,6 +1059,31 @@ namespace MonoXR.Client
                     var hit = pillHit == null ? HitTest(mx, my) : null;
                     bool wasSelected = hit != null && hit == _selected;
 
+                    // Shift+click adds to / removes from a multi-selection.
+                    if (hit != null && KeyDown(VK_SHIFT))
+                    {
+                        ToggleGroupMember(hit);
+                        _canvasDirty = true;
+                        _lmbWasDown = lmb;
+                        return;
+                    }
+                    // Pressing on a member of the group drags them all.
+                    if (hit != null && _group.Contains(hit))
+                    {
+                        BeginGroupDrag(mx, my);
+                        _lmbWasDown = lmb;
+                        return;
+                    }
+                    if (_group.Count > 0) { _group.Clear(); _canvasDirty = true; }
+                    // Empty canvas: the press starts a selection box.
+                    if (hit == null && pillHit == null)
+                    {
+                        _marquee = true;
+                        _marqueeX0 = mx;
+                        _marqueeY0 = my;
+                        _canvasDirty = true;
+                    }
+
                     // Select what was clicked (a hidden target's pill too,
                     // so it can be moved or shown again); empty canvas deselects.
                     var select = hit ?? pillHit;
@@ -974,6 +1127,17 @@ namespace MonoXR.Client
                     }
                 }
             }
+            else if (!lmb && _groupDrag)
+            {
+                EndGroupDrag();
+            }
+            else if (!lmb && _marquee)
+            {
+                _marquee = false;
+                SelectInBox(Math.Min(_marqueeX0, mx), Math.Min(_marqueeY0, my),
+                            Math.Max(_marqueeX0, mx), Math.Max(_marqueeY0, my));
+                _canvasDirty = true;
+            }
             else if (!lmb && _dragTarget != null)
             {
                 var done = _dragTarget;
@@ -1005,6 +1169,14 @@ namespace MonoXR.Client
                 float sy = (my - rt.Y) / (float)Math.Max(1, rt.SourceHeight);
                 rt.Scale = Math.Max(sx, sy);
             }
+            else if (lmb && _groupDrag)
+            {
+                MoveGroupTo(mx - _groupPressX, my - _groupPressY);
+            }
+            else if (lmb && _marquee)
+            {
+                _canvasDirty = true; // the box follows the cursor
+            }
             else if (lmb && _dragTarget != null)
             {
                 _dragTarget.X = Math.Clamp(mx - _dragOffsetX, 0, Math.Max(0, CanvasWidth - _dragTarget.DisplayWidth));
@@ -1018,6 +1190,86 @@ namespace MonoXR.Client
             _lmbWasDown = lmb;
         }
 
+        // Add the target to the multi-selection, or take it out if it is in.
+        private void ToggleGroupMember(OverlayRenderTarget rt)
+        {
+            var members = new List<OverlayRenderTarget>(_group);
+            if (members.Count == 0 && _selected != null) members.Add(_selected);
+            if (!members.Remove(rt)) members.Add(rt);
+            SetSelection(members);
+        }
+
+        // One target is the ordinary selection (with its button bar); two or more
+        // are a group.
+        private void SetSelection(List<OverlayRenderTarget> members)
+        {
+            _group.Clear();
+            if (members.Count >= 2)
+            {
+                _group.AddRange(members);
+                _selected = null;
+            }
+            else
+            {
+                _selected = members.Count == 1 ? members[0] : null;
+            }
+        }
+
+        // Finish a selection box: everything shown that it touches. Panels that
+        // only exist for editing (the settings panels) are left out.
+        private void SelectInBox(int left, int top, int right, int bottom)
+        {
+            if (right - left < 4 && bottom - top < 4) return; // a click, not a box
+
+            var found = new List<OverlayRenderTarget>();
+            foreach (var rt in _targets)
+            {
+                if (!rt.Visible || rt.IsSkipped(EditMode) || rt.EditModeOnly) continue;
+                if (rt.X < right && rt.X + rt.DisplayWidth > left && rt.Y < bottom && rt.Y + rt.DisplayHeight > top)
+                    found.Add(rt);
+            }
+            SetSelection(found);
+        }
+
+        private void BeginGroupDrag(int mx, int my)
+        {
+            _groupDrag = true;
+            _groupPressX = mx;
+            _groupPressY = my;
+            _groupStart.Clear();
+            foreach (var rt in _group) _groupStart[rt] = (rt.X, rt.Y);
+            _canvasDirty = true;
+        }
+
+        // Move the whole group by the drag distance, stopping when any member
+        // reaches the canvas edge so they keep their arrangement.
+        private void MoveGroupTo(int dx, int dy)
+        {
+            int minDx = int.MinValue, maxDx = int.MaxValue, minDy = int.MinValue, maxDy = int.MaxValue;
+            foreach (var rt in _group)
+            {
+                var (x, y) = _groupStart[rt];
+                minDx = Math.Max(minDx, -x);
+                maxDx = Math.Min(maxDx, CanvasWidth - rt.DisplayWidth - x);
+                minDy = Math.Max(minDy, -y);
+                maxDy = Math.Min(maxDy, CanvasHeight - rt.DisplayHeight - y);
+            }
+            dx = Math.Clamp(dx, minDx, Math.Max(minDx, maxDx));
+            dy = Math.Clamp(dy, minDy, Math.Max(minDy, maxDy));
+            foreach (var rt in _group)
+            {
+                var (x, y) = _groupStart[rt];
+                rt.X = x + dx;
+                rt.Y = y + dy;
+            }
+        }
+
+        private void EndGroupDrag()
+        {
+            _groupDrag = false;
+            foreach (var rt in _group) DragCompleted?.Invoke(rt);
+        }
+
         private const int VK_SHIFT = 0x10, VK_LEFT = 0x25, VK_UP = 0x26, VK_RIGHT = 0x27, VK_DOWN = 0x28;
         private static readonly TimeSpan NudgeFirstDelay = TimeSpan.FromMilliseconds(350);
         private static readonly TimeSpan NudgeRepeat = TimeSpan.FromMilliseconds(35);
@@ -1026,6 +1278,7 @@ namespace MonoXR.Client
         private bool _nudgeMoved;
         private TimeSpan _nudgeNextAt;
         private OverlayRenderTarget? _nudgeTarget;
+        private readonly List<OverlayRenderTarget> _nudgeGroup = new();
 
         private static bool KeyDown(int vk) => (GetAsyncKeyState(vk) & 0x8000) != 0;
 
@@ -1038,17 +1291,22 @@ namespace MonoXR.Client
         /// </summary>
         private void UpdateArrowNudge()
         {
-            var rt = _selected;
+            var rt = _selected ?? (_group.Count > 0 ? _group[0] : null);
             int dx = (KeyDown(VK_RIGHT) ? 1 : 0) - (KeyDown(VK_LEFT) ? 1 : 0);
             int dy = (KeyDown(VK_DOWN) ? 1 : 0) - (KeyDown(VK_UP) ? 1 : 0);
 
-            bool busy = _dragTarget != null || _resizeTarget != null || _editCapture != null;
+            bool busy = _dragTarget != null || _resizeTarget != null || _editCapture != null || _groupDrag;
             if (rt == null || busy || (dx == 0 && dy == 0))
             {
-                if (_nudgeMoved && _nudgeTarget != null) DragCompleted?.Invoke(_nudgeTarget);
+                if (_nudgeMoved && _nudgeTarget != null)
+                {
+                    if (_nudgeGroup.Count > 0) foreach (var m in _nudgeGroup) DragCompleted?.Invoke(m);
+                    else DragCompleted?.Invoke(_nudgeTarget);
+                }
                 _nudgeHeld = false;
                 _nudgeMoved = false;
                 _nudgeTarget = null;
+                _nudgeGroup.Clear();
                 return;
             }
 
@@ -1058,6 +1316,24 @@ namespace MonoXR.Client
             _nudgeHeld = true;
 
             int step = KeyDown(VK_SHIFT) ? 10 : 1;
+            if (_group.Count > 0)
+            {
+                // The whole group, kept in step: it stops when any member hits the edge.
+                int gx = dx * step, gy = dy * step;
+                foreach (var m in _group)
+                {
+                    gx = Math.Clamp(gx, -m.X, Math.Max(-m.X, CanvasWidth - m.DisplayWidth - m.X));
+                    gy = Math.Clamp(gy, -m.Y, Math.Max(-m.Y, CanvasHeight - m.DisplayHeight - m.Y));
+                }
+                if (gx == 0 && gy == 0) return;
+                foreach (var m in _group) { m.X += gx; m.Y += gy; }
+                _nudgeGroup.Clear();
+                _nudgeGroup.AddRange(_group);
+                _nudgeMoved = true;
+                _nudgeTarget = rt;
+                _canvasDirty = true;
+                return;
+            }
             int x = Math.Clamp(rt.X + dx * step, 0, Math.Max(0, CanvasWidth - rt.DisplayWidth));
             int y = Math.Clamp(rt.Y + dy * step, 0, Math.Max(0, CanvasHeight - rt.DisplayHeight));
             if (x == rt.X && y == rt.Y) return;
@@ -1155,13 +1431,13 @@ namespace MonoXR.Client
             bool hasState = !rt.EditModeOnly;
             bool hasGaze = GazeButtonState != null && !rt.EditModeOnly;
             bool hasBind = BindButtonLabel != null && !rt.EditModeOnly;
-            bool hasShow = ShowButtonLabel != null && !rt.EditModeOnly;
+            bool hasShow = ShowChips != null && !rt.EditModeOnly;
             int bindW = hasBind ? GetBindButtonWidth(rt) : 0;
             int barW = (hasState ? EditIconBtnWidth + EditBtnWidth + EditBtnGap * 2 : 0)
                      + EditStepBtnWidth * 2 + EditOpacityBtnWidth + EditBtnGap * 2
                      + (hasGaze ? EditIconBtnWidth + EditBtnGap : 0)
                      + (hasBind ? bindW + EditBtnGap : 0)
-                     + (hasShow ? EditShowBtnWidth + EditBtnGap : 0);
+                     + (hasShow ? GetShowChipsWidth(rt) + EditBtnGap : 0);
             int bx = Math.Clamp(rt.X, 0, Math.Max(0, CanvasWidth - barW));
 
             XnaRectangle Next(int width)
@@ -1177,7 +1453,7 @@ namespace MonoXR.Client
                     Next(EditStepBtnWidth), Next(EditOpacityBtnWidth), Next(EditStepBtnWidth),
                     hasGaze ? Next(EditIconBtnWidth) : XnaRectangle.Empty,
                     hasBind ? Next(bindW) : XnaRectangle.Empty,
-                    hasShow ? Next(EditShowBtnWidth) : XnaRectangle.Empty);
+                    hasShow ? Next(GetShowChipsWidth(rt)) : XnaRectangle.Empty);
         }
 
         /// <summary>
@@ -1193,6 +1469,33 @@ namespace MonoXR.Client
             if (!active) return string.Empty;
             const string lead = "Bind:";
             return label.StartsWith(lead, StringComparison.OrdinalIgnoreCase) ? label.Substring(lead.Length).Trim() : label;
+        }
+
+        private int GetShowChipWidth(string label) =>
+            EditFont == null ? 80 : (int)MathF.Ceiling(EditFont.MeasureString(label).X) + EditShowChipPad;
+
+        private int GetShowChipsWidth(OverlayRenderTarget rt)
+        {
+            var chips = ShowChips!(rt);
+            int w = 0;
+            for (int i = 0; i < chips.Count; i++)
+                w += GetShowChipWidth(chips[i].Label) + (i > 0 ? EditShowChipGap : 0);
+            return w;
+        }
+
+        /// <summary>Each Show chip's rectangle, laid left to right inside the bar's <paramref name="show"/> rectangle.</summary>
+        private List<XnaRectangle> GetShowChipRects(OverlayRenderTarget rt, XnaRectangle show)
+        {
+            var chips = ShowChips!(rt);
+            var rects = new List<XnaRectangle>(chips.Count);
+            int x = show.X;
+            foreach (var chip in chips)
+            {
+                int w = GetShowChipWidth(chip.Label);
+                rects.Add(new XnaRectangle(x, show.Y, w, show.Height));
+                x += w + EditShowChipGap;
+            }
+            return rects;
         }
 
         private int GetBindButtonWidth(OverlayRenderTarget rt)
@@ -1242,9 +1545,15 @@ namespace MonoXR.Client
                 }
                 if (!show.IsEmpty && show.Contains(mx, my))
                 {
-                    ShowModeCycleRequested?.Invoke(rt);
-                    _canvasDirty = true;
-                    return true;
+                    var rects = GetShowChipRects(rt, show);
+                    for (int i = 0; i < rects.Count; i++)
+                    {
+                        if (!rects[i].Contains(mx, my)) continue;
+                        ShowChipClicked?.Invoke(rt, i);
+                        _canvasDirty = true;
+                        break;
+                    }
+                    return true; // the gap between chips is still part of the bar
                 }
                 if (!collapse.IsEmpty && collapse.Contains(mx, my))
                 {
@@ -1418,6 +1727,7 @@ namespace MonoXR.Client
             newOverlay.Position = old.Position;
             newOverlay.Rotation = old.Rotation;
             newOverlay.Size = old.Size;
+            newOverlay.CurveRadius = old.CurveRadius;
             newOverlay.ZOrder = old.ZOrder;
             newOverlay.Visible = old.Visible;
             old.Dispose();
@@ -1558,10 +1868,10 @@ namespace MonoXR.Client
         {
             _compositor.Begin(SpriteSortMode.Deferred, BlendState.AlphaBlend, SamplerState.PointClamp);
             int dw = rt.DisplayWidth, dh = rt.DisplayHeight;
-            bool active = rt == _dragTarget || rt == _resizeTarget;
-            var c = active          ? XnaColor.Lime
-                  : rt == _selected ? XnaColor.Cyan
-                                    : XnaColor.Yellow;
+            bool active = rt == _dragTarget || rt == _resizeTarget || (_groupDrag && _group.Contains(rt));
+            var c = active                                   ? XnaColor.Lime
+                  : rt == _selected || _group.Contains(rt)   ? XnaColor.Cyan
+                                                             : XnaColor.Yellow;
             _compositor.Draw(_whitePixel, new XnaRectangle(rt.X, rt.Y, dw, 2), c);
             _compositor.Draw(_whitePixel, new XnaRectangle(rt.X, rt.Y + dh - 2, dw, 2), c);
             _compositor.Draw(_whitePixel, new XnaRectangle(rt.X, rt.Y, 2, dh), c);
@@ -1629,6 +1939,18 @@ namespace MonoXR.Client
                     DrawEditButton(show, "Show", false);
                 }
 
+                // The selection box being dragged over empty canvas.
+                if (_marquee)
+                {
+                    int l = Math.Min(_marqueeX0, _cursorX), t0 = Math.Min(_marqueeY0, _cursorY);
+                    int w0 = Math.Abs(_cursorX - _marqueeX0), h0 = Math.Abs(_cursorY - _marqueeY0);
+                    _compositor.Draw(_whitePixel, new XnaRectangle(l, t0, w0, h0), XnaColor.Cyan * 0.15f);
+                    _compositor.Draw(_whitePixel, new XnaRectangle(l, t0, w0, 2), XnaColor.Cyan);
+                    _compositor.Draw(_whitePixel, new XnaRectangle(l, t0 + h0 - 2, w0, 2), XnaColor.Cyan);
+                    _compositor.Draw(_whitePixel, new XnaRectangle(l, t0, 2, h0), XnaColor.Cyan);
+                    _compositor.Draw(_whitePixel, new XnaRectangle(l + w0 - 2, t0, 2, h0), XnaColor.Cyan);
+                }
+
                 // Button bar for the selected, shown target only: Collapse /
                 // Hide, opacity, Bind, Show mode.
                 if (_selected is { Visible: true } sel)
@@ -1643,10 +1965,12 @@ namespace MonoXR.Client
                     if (!gaze.IsEmpty && GazeButtonState != null) DrawGazeButton(gaze, GazeButtonState(rt));
                     if (!bind.IsEmpty && BindButtonLabel != null)
                         DrawBindButton(bind, BindButtonLabel(rt).Active, GetBindButtonText(rt));
-                    if (!show.IsEmpty && ShowButtonLabel != null)
+                    if (!show.IsEmpty && ShowChips != null)
                     {
-                        var (label, active) = ShowButtonLabel(rt);
-                        DrawEditButton(show, label, active);
+                        var chips = ShowChips(rt);
+                        var rects = GetShowChipRects(rt, show);
+                        for (int i = 0; i < chips.Count; i++)
+                            DrawEditButton(rects[i], chips[i].Label, chips[i].On);
                     }
                 }
 
@@ -1674,6 +1998,7 @@ namespace MonoXR.Client
             var canvas = _overlay;
             _cursorOverlay.Space = canvas.Space;
             _cursorOverlay.Rotation = canvas.Rotation;
+            _cursorOverlay.CurveRadius = 0f; // always a flat marker
             _cursorOverlay.Size = new Vector2(CursorHalfLengthMeters * 2f, CursorHalfLengthMeters * 2f);
             // Hidden while calibrating (the user lines up the GAME'S cursor then).
             _cursorOverlay.Visible = canvas.Visible && _calStep == 0;
@@ -1681,6 +2006,15 @@ namespace MonoXR.Client
             // Quad-local: centered, +X right, +Y up, in meters.
             float u = (_cursorX + 0.5f) / CanvasWidth, v = (_cursorY + 0.5f) / CanvasHeight;
             var local = new Vector3((u - 0.5f) * canvas.Size.X, (0.5f - v) * canvas.Size.Y, 0f);
+            if (_curved)
+            {
+                // Follow the surface: x is arc length, so turn about the axis
+                // (which sits one radius behind the quad's centre) by that arc.
+                float radius = CurveRadius;
+                float phi = local.X / radius;
+                local = new Vector3(radius * MathF.Sin(phi), local.Y, radius * (1f - MathF.Cos(phi)));
+                _cursorOverlay.Rotation = canvas.Rotation * Quaternion.CreateFromAxisAngle(Vector3.UnitY, -phi);
+            }
             _cursorOverlay.Position = canvas.Position + Vector3.Transform(local, canvas.Rotation);
 
             if (_cursorPublished)
@@ -1964,6 +2298,7 @@ namespace MonoXR.Client
             fresh.Position = old.Position;
             fresh.Rotation = old.Rotation;
             fresh.Size = old.Size;
+            fresh.CurveRadius = old.CurveRadius;
             fresh.ZOrder = old.ZOrder;
             fresh.Visible = old.Visible;
             old.Dispose();

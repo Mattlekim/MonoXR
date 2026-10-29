@@ -139,6 +139,7 @@ static PFN_xrGetActionStatePose              down_xrGetActionStatePose = nullptr
 
 static XrInstance g_instance = XR_NULL_HANDLE;
 static bool       g_eyeExtEnabled = false;   // XR_EXT_eye_gaze_interaction is on for this instance
+static bool       g_cylinderExtEnabled = false; // XR_KHR_composition_layer_cylinder is on for this instance
 static XrPath     g_eyeProfilePath = XR_NULL_PATH;
 static XrPath     g_eyeGazePosePath = XR_NULL_PATH;
 
@@ -511,8 +512,11 @@ static XrResult XRAPI_CALL MonoXr_xrEndFrame(XrSession session, const XrFrameEnd
 
     // Storage must outlive the down-call; reserve so pointers stay stable.
     static std::vector<XrCompositionLayerQuad> quads;
+    static std::vector<XrCompositionLayerCylinderKHR> cylinders;
     quads.clear();
+    cylinders.clear();
     quads.reserve(MONOXR_MAX_OVERLAYS);
+    cylinders.reserve(MONOXR_MAX_OVERLAYS);
     std::vector<const XrCompositionLayerBaseHeader*> layers;
 
     // Keep the app's own layers first (world renders under the overlays).
@@ -531,6 +535,34 @@ static XrResult XRAPI_CALL MonoXr_xrEndFrame(XrSession session, const XrFrameEnd
 
         XrSwapchainSubImage sub{};
         if (!RenderSlot(s, r, slot, sub)) continue;
+
+        // A curved overlay goes out as a cylinder layer when the runtime has them;
+        // otherwise it stays the flat quad it always was.
+        if (g_cylinderExtEnabled && slot.curveRadius > 0.05f && slot.sizeX > 0.0f && slot.sizeY > 0.0f) {
+            XrCompositionLayerCylinderKHR c{ XR_TYPE_COMPOSITION_LAYER_CYLINDER_KHR };
+            c.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT |
+                           XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT;
+            c.space = (slot.space == MONOXR_SPACE_HEAD) ? s.headSpace : s.worldSpace;
+            c.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+            c.subImage = sub;
+            // The cylinder layer's pose is the cylinder's centre; the surface sits
+            // `radius` in front of it (-Z). Move the centre back from the quad's
+            // centre along the quad's +Z so the surface passes through the quad.
+            const float qx = slot.quatX, qy = slot.quatY, qz = slot.quatZ, qw = slot.quatW;
+            const float R = slot.curveRadius;
+            // Rotate (0, 0, R) by the quaternion: the third column of its matrix, times R.
+            const float bx = 2.0f * (qx * qz + qw * qy) * R;
+            const float by = 2.0f * (qy * qz - qw * qx) * R;
+            const float bz = (1.0f - 2.0f * (qx * qx + qy * qy)) * R;
+            c.pose.position = { slot.posX + bx, slot.posY + by, slot.posZ + bz };
+            c.pose.orientation = { qx, qy, qz, qw };
+            c.radius = R;
+            c.centralAngle = std::fmin(slot.sizeX / R, 6.2831f); // arc length / radius, at most a full turn
+            c.aspectRatio = slot.sizeX / slot.sizeY;   // arc length / height
+            cylinders.push_back(c);
+            layers.push_back(reinterpret_cast<const XrCompositionLayerBaseHeader*>(&cylinders.back()));
+            continue;
+        }
 
         XrCompositionLayerQuad q{ XR_TYPE_COMPOSITION_LAYER_QUAD };
         q.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT |
@@ -556,14 +588,16 @@ static XrResult XRAPI_CALL MonoXr_xrEndFrame(XrSession session, const XrFrameEnd
     // line every second. The quad detail still prints on each change, so a
     // "quad submitted but nothing in VR" case remains diagnosable.
     static size_t lastQuadCount = (size_t)-1;
+    static size_t lastCylinderCount = (size_t)-1;
     static XrResult lastEfRes = XR_SUCCESS;
     static bool loggedOnce = false;
-    if (!loggedOnce || quads.size() != lastQuadCount || efRes != lastEfRes) {
+    if (!loggedOnce || quads.size() != lastQuadCount || cylinders.size() != lastCylinderCount || efRes != lastEfRes) {
         loggedOnce = true;
         lastQuadCount = quads.size();
+        lastCylinderCount = cylinders.size();
         lastEfRes = efRes;
-        LogLine("endFrame: appManaged=%u quads=%zu totalLayers=%zu down_xrEndFrame=%d",
-                frameEndInfo->layerCount, quads.size(), layers.size(), efRes);
+        LogLine("endFrame: appManaged=%u quads=%zu cylinders=%zu totalLayers=%zu down_xrEndFrame=%d",
+                frameEndInfo->layerCount, quads.size(), cylinders.size(), layers.size(), efRes);
         for (size_t qi = 0; qi < quads.size(); ++qi) {
             const auto& q = quads[qi];
             const char* sp = (q.space == s.headSpace) ? "HEAD"
@@ -860,40 +894,58 @@ static XrResult XRAPI_CALL MonoXr_xrCreateApiLayerInstance(const XrInstanceCreat
     XrApiLayerCreateInfo local = *apiLayerInfo;
     local.nextInfo = apiLayerInfo->nextInfo->next; // advance to the next layer
 
-    // Turn on XR_EXT_eye_gaze_interaction for the app if the runtime has it and
-    // the app has not asked for it: the app never has to know, the layer reads
-    // the gaze itself. If the runtime refuses the extra extension, create the
-    // instance exactly as the app asked.
-    bool appHasEye = false;
-    for (uint32_t i = 0; info && i < info->enabledExtensionCount; ++i)
+    // Turn on XR_EXT_eye_gaze_interaction and XR_KHR_composition_layer_cylinder
+    // for the app if the runtime has them and the app has not asked for them:
+    // the app never has to know, the layer reads the gaze and draws curved
+    // overlays itself. If the runtime refuses the extra extensions, try them one
+    // at a time, and finally create the instance exactly as the app asked.
+    bool appHasEye = false, appHasCyl = false;
+    for (uint32_t i = 0; info && i < info->enabledExtensionCount; ++i) {
         if (strcmp(info->enabledExtensionNames[i], XR_EXT_EYE_GAZE_INTERACTION_EXTENSION_NAME) == 0) appHasEye = true;
+        if (strcmp(info->enabledExtensionNames[i], XR_KHR_COMPOSITION_LAYER_CYLINDER_EXTENSION_NAME) == 0) appHasCyl = true;
+    }
+    const bool addEye = !appHasEye && info && RuntimeHasExtension(nextGipa, XR_EXT_EYE_GAZE_INTERACTION_EXTENSION_NAME);
+    const bool addCyl = !appHasCyl && info && RuntimeHasExtension(nextGipa, XR_KHR_COMPOSITION_LAYER_CYLINDER_EXTENSION_NAME);
 
     XrResult res = XR_ERROR_INITIALIZATION_FAILED;
-    bool eyeEnabled = false;
-    if (!appHasEye && info && RuntimeHasExtension(nextGipa, XR_EXT_EYE_GAZE_INTERACTION_EXTENSION_NAME)) {
+    bool eyeEnabled = appHasEye, cylEnabled = appHasCyl;
+    bool created = false;
+    struct Attempt { bool eye, cyl; };
+    const Attempt attempts[] = { { addEye, addCyl }, { addEye, false }, { false, addCyl } };
+    for (size_t ai = 0; ai < 3 && !created; ++ai) {
+        const Attempt& at = attempts[ai];
+        if (!at.eye && !at.cyl) continue;
+        if (ai > 0 && at.eye == attempts[ai - 1].eye && at.cyl == attempts[ai - 1].cyl) continue;
         std::vector<const char*> names(info->enabledExtensionNames,
                                        info->enabledExtensionNames + info->enabledExtensionCount);
-        names.push_back(XR_EXT_EYE_GAZE_INTERACTION_EXTENSION_NAME);
+        if (at.eye) names.push_back(XR_EXT_EYE_GAZE_INTERACTION_EXTENSION_NAME);
+        if (at.cyl) names.push_back(XR_KHR_COMPOSITION_LAYER_CYLINDER_EXTENSION_NAME);
         XrInstanceCreateInfo patched = *info;
         patched.enabledExtensionCount = (uint32_t)names.size();
         patched.enabledExtensionNames = names.data();
+        local = *apiLayerInfo;
+        local.nextInfo = apiLayerInfo->nextInfo->next;
         res = nextCreate(&patched, &local, instance);
-        LogLine("  created instance with XR_EXT_eye_gaze_interaction added: %d", res);
-        eyeEnabled = XR_SUCCEEDED(res);
+        LogLine("  created instance with added extensions (eye gaze %d, cylinder %d): %d", at.eye, at.cyl, res);
+        if (XR_SUCCEEDED(res)) {
+            created = true;
+            eyeEnabled = appHasEye || at.eye;
+            cylEnabled = appHasCyl || at.cyl;
+        }
     }
-    if (!eyeEnabled) {
+    if (!created) {
         local = *apiLayerInfo;
         local.nextInfo = apiLayerInfo->nextInfo->next;
         res = nextCreate(info, &local, instance);
-        eyeEnabled = appHasEye && XR_SUCCEEDED(res);
     }
-    LogLine("  chained nextCreateApiLayerInstance returned %d (eye gaze ext %s)", res,
-            eyeEnabled ? "on" : "off");
+    LogLine("  chained nextCreateApiLayerInstance returned %d (eye gaze ext %s, cylinder ext %s)", res,
+            eyeEnabled ? "on" : "off", cylEnabled ? "on" : "off");
     if (XR_FAILED(res)) return res;
 
     g_nextGipa = nextGipa;
     g_instance = *instance;
     g_eyeExtEnabled = eyeEnabled;
+    g_cylinderExtEnabled = cylEnabled;
 
     #define RESOLVE(fn) nextGipa(*instance, #fn, (PFN_xrVoidFunction*)&down_##fn)
     RESOLVE(xrCreateSession);

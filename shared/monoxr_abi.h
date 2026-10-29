@@ -45,7 +45,13 @@ struct MonoXrOverlaySlot {
     // Sort order; higher draws on top. Also used to keep a stable layer order.
     int32_t zOrder;
 
-    uint32_t _pad0;
+    // 0 = a flat quad. Above 0 the overlay is curved onto a cylinder of this
+    // radius in meters (XR_KHR_composition_layer_cylinder), its axis vertical and
+    // its centre `curveRadius` behind the quad's centre along the quad's +Z, so
+    // the quad's size becomes the arc length and height of the curved surface.
+    // The layer falls back to the flat quad when the runtime has no cylinder
+    // layers. (Was padding, so older clients write 0 = flat.)
+    float curveRadius;
 
     // Bumped by the client every time a fresh frame is copied into the shared
     // texture. The layer copies only when this changes (cheap idle path).

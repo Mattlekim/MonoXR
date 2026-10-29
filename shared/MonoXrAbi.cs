@@ -51,7 +51,7 @@ public unsafe struct MonoXrOverlaySlot
     public float SizeX, SizeY;
 
     public int ZOrder;
-    public uint Pad0;
+    public float CurveRadius; // 0 = flat quad; >0 = cylinder of this radius in meters
 
     public ulong FrameIndex;
 
