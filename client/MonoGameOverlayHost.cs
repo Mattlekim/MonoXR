@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Numerics;
 using Microsoft.Xna.Framework.Graphics;
 using GameTime = Microsoft.Xna.Framework.GameTime;
@@ -764,7 +765,7 @@ namespace MonoXR.Client
                 if (_editMode == value) return;
                 _editMode = value;
                 _canvasDirty = true;
-                if (!value) { _selected = null; _group.Clear(); _marquee = false; _groupDrag = false; _showMenuOpen = false; CloseDocks(); }
+                if (!value) { _selected = null; _group.Clear(); _marquee = false; _groupDrag = false; _showMenuOpen = false; _ctxOpen = false; CloseDocks(); }
                 EditModeChanged?.Invoke(value);
                 // Let targets react (e.g. draw a placeholder while edited).
                 foreach (var rt in _targets)
@@ -945,6 +946,193 @@ namespace MonoXR.Client
         // Shift+click): two or more targets that move together. Empty while a single
         // target (or none) is selected; then _selected is null, so no button bar.
         private readonly List<OverlayRenderTarget> _group = new();
+
+        // Saved groups ("Group" in the right-click menu): panels that are selected,
+        // and so moved, together whenever one of them is clicked. A panel is in at
+        // most one group, and a group has at least two panels.
+        private readonly List<List<OverlayRenderTarget>> _groups = new();
+
+        /// <summary>Raised after the user groups or ungroups panels, so the app can remember it.</summary>
+        public event Action? GroupsChanged;
+
+        /// <summary>The saved groups, each a list of panels that move together.</summary>
+        public IReadOnlyList<IReadOnlyList<OverlayRenderTarget>> Groups => _groups;
+
+        /// <summary>Replace the saved groups (e.g. restored from settings). Entries with fewer than two panels are dropped.</summary>
+        public void SetGroups(IEnumerable<IEnumerable<OverlayRenderTarget>> groups)
+        {
+            _groups.Clear();
+            var used = new HashSet<OverlayRenderTarget>();
+            foreach (var g in groups)
+            {
+                var members = g.Where(used.Add).ToList();
+                if (members.Count >= 2) _groups.Add(members);
+            }
+            _canvasDirty = true;
+        }
+
+        private List<OverlayRenderTarget>? GroupOf(OverlayRenderTarget rt) => _groups.Find(g => g.Contains(rt));
+
+        // The panel plus the rest of its saved group, as far as they are shown.
+        private List<OverlayRenderTarget> WithGroupmates(OverlayRenderTarget rt)
+        {
+            var list = GroupOf(rt) is { } g
+                ? g.Where(m => m.Visible && !m.IsSkipped(EditMode) && !m.EditModeOnly).ToList()
+                : new List<OverlayRenderTarget>();
+            if (!list.Contains(rt)) list.Add(rt);
+            return list;
+        }
+
+        // What is selected: the multi-selection, or the one selected panel.
+        private List<OverlayRenderTarget> CurrentSelection() =>
+            _group.Count > 0 ? new List<OverlayRenderTarget>(_group)
+            : _selected != null ? new List<OverlayRenderTarget> { _selected }
+            : new List<OverlayRenderTarget>();
+
+        // ----- Right-click menu (edit mode) -------------------------------------
+        // Right-clicking a selected panel (or any panel, which selects it first)
+        // opens a small menu at the pointer: Group / Ungroup the selection, or
+        // centre it vertically / horizontally. A click on a row runs it; a click
+        // anywhere else just closes the menu.
+        private bool _ctxOpen;
+        private int _ctxX, _ctxY;
+        private readonly List<(string Label, Action Run)> _ctxItems = new();
+        private bool _editRmbWasDown;
+
+        private const int CtxMenuWidth = 330;
+        private const int CtxRowGap = 4;
+
+        private List<XnaRectangle> GetCtxRects()
+        {
+            int rowH = EditBtnHeight;
+            int height = _ctxItems.Count * rowH + (_ctxItems.Count - 1) * CtxRowGap;
+            int x = Math.Clamp(_ctxX, 0, Math.Max(0, CanvasWidth - CtxMenuWidth));
+            int y = Math.Clamp(_ctxY, 0, Math.Max(0, CanvasHeight - height));
+            var rects = new List<XnaRectangle>(_ctxItems.Count);
+            for (int i = 0; i < _ctxItems.Count; i++)
+                rects.Add(new XnaRectangle(x, y + i * (rowH + CtxRowGap), CtxMenuWidth, rowH));
+            return rects;
+        }
+
+        private void HandleEditRightPress(int mx, int my)
+        {
+            _ctxOpen = false;
+            _showMenuOpen = false;
+            _canvasDirty = true;
+
+            var hit = HitTest(mx, my);
+            if (hit == null || hit.IsDocked || hit.EditModeOnly) return;
+
+            var sel = CurrentSelection();
+            if (!sel.Contains(hit))
+            {
+                // Right-clicking something else selects it (and its group) first.
+                SetSelection(WithGroupmates(hit));
+                sel = CurrentSelection();
+            }
+
+            _ctxItems.Clear();
+            var firstGroup = GroupOf(sel[0]);
+            bool exactlyAGroup = sel.Count >= 2 && firstGroup != null &&
+                                 firstGroup.Count == sel.Count && sel.All(m => GroupOf(m) == firstGroup);
+            if (sel.Count >= 2 && !exactlyAGroup) _ctxItems.Add(("Group", GroupSelection));
+            if (sel.Any(m => GroupOf(m) != null)) _ctxItems.Add(("Ungroup", UngroupSelection));
+            _ctxItems.Add(("Center vertically", () => CenterSelection(vertical: true)));
+            _ctxItems.Add(("Center horizontally", () => CenterSelection(vertical: false)));
+
+            _ctxX = mx;
+            _ctxY = my;
+            _ctxOpen = true;
+        }
+
+        /// <summary>Press while the right-click menu is open: run the row hit, or close the menu. True when the press was used.</summary>
+        private bool HandleCtxMenuClick(int mx, int my)
+        {
+            if (!_ctxOpen) return false;
+            var rects = GetCtxRects();
+            _ctxOpen = false;
+            _canvasDirty = true;
+            for (int i = 0; i < rects.Count; i++)
+            {
+                if (!rects[i].Contains(mx, my)) continue;
+                _ctxItems[i].Run();
+                return true;
+            }
+            return false; // a click elsewhere closes the menu and goes on to whatever is there
+        }
+
+        private void GroupSelection()
+        {
+            var sel = CurrentSelection();
+            if (sel.Count < 2) return;
+            RemoveFromGroups(sel);
+            _groups.Add(sel);
+            GroupsChanged?.Invoke();
+        }
+
+        private void UngroupSelection()
+        {
+            RemoveFromGroups(CurrentSelection());
+            GroupsChanged?.Invoke();
+        }
+
+        // A panel is in one group at most; groups left with a single panel go.
+        private void RemoveFromGroups(List<OverlayRenderTarget> members)
+        {
+            foreach (var g in _groups) g.RemoveAll(members.Contains);
+            _groups.RemoveAll(g => g.Count < 2);
+            _canvasDirty = true;
+        }
+
+        // Several panels line up on a shared centre line (the middle of their combined
+        // bounds); a single panel is centred on the screens: the canvas, below the
+        // top screen's band if there is one.
+        private void CenterSelection(bool vertical)
+        {
+            var sel = CurrentSelection();
+            if (sel.Count == 0) return;
+
+            int band = BandPx();
+            int start, length;
+            if (sel.Count >= 2)
+            {
+                int lo = int.MaxValue, hi = int.MinValue;
+                foreach (var m in sel)
+                {
+                    int a = vertical ? m.Y : m.X, size = vertical ? m.DisplayHeight : m.DisplayWidth;
+                    lo = Math.Min(lo, a);
+                    hi = Math.Max(hi, a + size);
+                }
+                start = lo;
+                length = hi - lo;
+            }
+            else
+            {
+                start = vertical ? band : 0;
+                length = vertical ? CanvasHeight - band : CanvasWidth;
+            }
+            int center = start + length / 2;
+
+            foreach (var m in sel)
+            {
+                if (vertical) m.Y = Math.Clamp(center - m.DisplayHeight / 2, 0, Math.Max(0, CanvasHeight - m.DisplayHeight));
+                else m.X = Math.Clamp(center - m.DisplayWidth / 2, 0, Math.Max(0, CanvasWidth - m.DisplayWidth));
+                DragCompleted?.Invoke(m); // so the app saves the new position
+            }
+            _canvasDirty = true;
+        }
+
+        private void DrawCtxMenu()
+        {
+            var rects = GetCtxRects();
+            for (int i = 0; i < rects.Count; i++)
+            {
+                MonoXRDraw.RoundedRect(_compositor, rects[i], 8, new XnaColor(30, 30, 48));
+                MonoXRDraw.RoundedRectOutline(_compositor, rects[i], 8, 2, XnaColor.Yellow);
+                DrawButtonText(new XnaRectangle(rects[i].X + 18, rects[i].Y, rects[i].Width - 36, rects[i].Height),
+                               _ctxItems[i].Label, false);
+            }
+        }
         private bool _marquee;                       // a selection box is being dragged
         private int _marqueeX0, _marqueeY0;          // where it started (canvas px)
         private bool _groupDrag;                     // the group is being dragged
@@ -1321,6 +1509,10 @@ namespace MonoXR.Client
             bool lmb = LeftButtonOverride?.Invoke()
                        ?? ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0);
 
+            bool rmb = PollRightButton();
+            if (rmb && !_editRmbWasDown) HandleEditRightPress(mx, my);
+            _editRmbWasDown = rmb;
+
             if (lmb && !_lmbWasDown)
             {
                 // Press: the button bars win over dragging; otherwise pick the
@@ -1333,6 +1525,11 @@ namespace MonoXR.Client
                     return;
                 }
                 if (_showMenuOpen && HandleShowMenuClick(mx, my))
+                {
+                    _lmbWasDown = lmb;
+                    return;
+                }
+                if (_ctxOpen && HandleCtxMenuClick(mx, my))
                 {
                     _lmbWasDown = lmb;
                     return;
@@ -1358,6 +1555,10 @@ namespace MonoXR.Client
                         _lmbWasDown = lmb;
                         return;
                     }
+                    // A panel in a saved group selects the whole group (Ctrl+click picks just that panel).
+                    if (hit != null && !_group.Contains(hit) && GroupOf(hit) != null && !KeyDown(VK_CONTROL))
+                        SetSelection(WithGroupmates(hit));
+
                     // Pressing on a member of the group drags them all.
                     if (hit != null && _group.Contains(hit))
                     {
@@ -1486,7 +1687,9 @@ namespace MonoXR.Client
         {
             var members = new List<OverlayRenderTarget>(_group);
             if (members.Count == 0 && _selected != null) members.Add(_selected);
-            if (!members.Remove(rt)) members.Add(rt);
+            var mates = WithGroupmates(rt); // a saved group goes in or out as one
+            if (members.Contains(rt)) members.RemoveAll(mates.Contains);
+            else foreach (var m in mates) if (!members.Contains(m)) members.Add(m);
             SetSelection(members);
         }
 
@@ -1561,7 +1764,7 @@ namespace MonoXR.Client
             foreach (var rt in _group) DragCompleted?.Invoke(rt);
         }
 
-        private const int VK_SHIFT = 0x10, VK_LEFT = 0x25, VK_UP = 0x26, VK_RIGHT = 0x27, VK_DOWN = 0x28;
+        private const int VK_CONTROL = 0x11, VK_SHIFT = 0x10, VK_LEFT = 0x25, VK_UP = 0x26, VK_RIGHT = 0x27, VK_DOWN = 0x28;
         private static readonly TimeSpan NudgeFirstDelay = TimeSpan.FromMilliseconds(350);
         private static readonly TimeSpan NudgeRepeat = TimeSpan.FromMilliseconds(35);
 
@@ -2453,6 +2656,7 @@ namespace MonoXR.Client
                     for (int i = 0; i < chips.Count; i++)
                         DrawShowMenuRow(rects[i], chips[i].Label, chips[i].On);
                 }
+                if (_ctxOpen) DrawCtxMenu();
 
                 _compositor.End();
             }
