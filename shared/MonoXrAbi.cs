@@ -4,7 +4,8 @@
 //   control header     = 32 bytes  (slots[] start at offset 32)
 //   MonoXrHeadPose     = 40 bytes  (after the slots, at offset 3296)
 //   MonoXrEyeGaze      = 40 bytes  (after the head pose, at offset 3336)
-//   full control block = 32 + 16*204 + 40 + 40 = 3376 bytes
+//   MonoXrTrackingControl = 32 bytes (after the eye gaze, at offset 3376)
+//   full control block = 32 + 16*204 + 40 + 40 + 32 = 3408 bytes
 using System.Runtime.InteropServices;
 
 namespace MonoXR.Shared;
@@ -23,7 +24,9 @@ public static class MonoXrConstants
     public const int HeadPoseSize = 40;
     public const int EyeGazeOffset = HeadPoseOffset + HeadPoseSize; // 3336
     public const int EyeGazeSize = 40;
-    public const int ControlSize = EyeGazeOffset + EyeGazeSize; // 3376
+    public const int TrackingOffset = EyeGazeOffset + EyeGazeSize; // 3376
+    public const int TrackingSize = 32;
+    public const int ControlSize = TrackingOffset + TrackingSize; // 3408
 
     // Keyed-mutex keys (see header).
     public const ulong KeyProducer = 0ul;
@@ -58,6 +61,26 @@ public unsafe struct MonoXrOverlaySlot
     public fixed char SharedName[MonoXrConstants.NameLen]; // 64 * 2 = 128 bytes
 }
 
+// Experimental head-tracking filter the client sets for the layer (see monoxr_abi.h).
+[StructLayout(LayoutKind.Sequential, Pack = 4)]
+public struct MonoXrTrackingControl
+{
+    public uint Flags;          // MonoXrTrackingFlags
+    public float Smoothing;     // 0..1
+    public float MinMovePosMm;
+    public float MinMoveRotDeg;
+    public float LockX, LockY, LockZ; // LOCAL space, meters
+    public uint Pad0;
+}
+
+[System.Flags]
+public enum MonoXrTrackingFlags : uint
+{
+    Smooth = 1,
+    MinMove = 2,
+    LockPosition = 4,
+}
+
 // Headset pose in WORLD (LOCAL) space, published by the layer every frame.
 // Seqlock on Seq: odd = mid-write, 0 = never published. Lives after the slots.
 [StructLayout(LayoutKind.Sequential, Pack = 4)]
@@ -67,7 +90,15 @@ public struct MonoXrHeadPose
     public uint Pad0;
     public float PosX, PosY, PosZ;
     public float QuatX, QuatY, QuatZ, QuatW;
-    public uint Pad1;
+    public uint Caps;   // MonoXrLayerCaps, written by the layer
+}
+
+// What the runtime under the layer can do (MonoXrHeadPose.Caps).
+[Flags]
+public enum MonoXrLayerCaps : uint
+{
+    Known = 1,      // the layer has filled the rest in
+    Cylinder = 2,   // XR_KHR_composition_layer_cylinder is on: curved overlays are possible
 }
 
 // What the layer knows about eye tracking.

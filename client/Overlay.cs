@@ -133,7 +133,17 @@ public sealed unsafe class Overlay : IDisposable
     /// published; false when it was skipped (disposed, or the layer still held
     /// the shared texture) — the caller should retry next frame.
     /// </summary>
-    public bool Update(IntPtr nativeTexture)
+    public bool Update(IntPtr nativeTexture) => Publish(nativeTexture, null);
+
+    /// <summary>
+    /// Like <see cref="Update(IntPtr)"/>, but the source may be bigger than this
+    /// overlay: only the <see cref="Width"/> x <see cref="Height"/> region whose
+    /// top-left corner is (<paramref name="srcX"/>, <paramref name="srcY"/>) is
+    /// copied. Lets one canvas feed several overlays, each showing a slice of it.
+    /// </summary>
+    public bool Update(IntPtr nativeTexture, int srcX, int srcY) => Publish(nativeTexture, (srcX, srcY));
+
+    private bool Publish(IntPtr nativeTexture, (int X, int Y)? origin)
     {
         if (_disposed) return false;
         if (nativeTexture == IntPtr.Zero)
@@ -155,7 +165,11 @@ public sealed unsafe class Overlay : IDisposable
         if (_cachedSrc is null || _cachedSrc.NativePointer != nativeTexture)
             _cachedSrc = new ID3D11Resource(nativeTexture); // borrowed ref — never disposed
 
-        _mgr.Context.CopyResource(_tex, _cachedSrc);
+        if (origin is { } o)
+            _mgr.Context.CopySubresourceRegion(_tex, 0u, 0u, 0u, 0u, _cachedSrc, 0u,
+                new Vortice.Mathematics.Box(o.X, o.Y, 0, o.X + _width, o.Y + _height, 1));
+        else
+            _mgr.Context.CopyResource(_tex, _cachedSrc);
 
         if (_mutexPtr != IntPtr.Zero)
             KeyedMutex.ReleaseSync(_mutexPtr, MonoXrConstants.KeyConsumer);

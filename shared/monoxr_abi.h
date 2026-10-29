@@ -72,7 +72,13 @@ struct MonoXrHeadPose {
     uint32_t _pad0;
     float posX, posY, posZ;
     float quatX, quatY, quatZ, quatW;
-    uint32_t _pad1;
+    uint32_t caps;      // MonoXrLayerCaps, written by the layer; 0 = not published (or an older layer)
+};
+
+// What the runtime under the layer can do (MonoXrHeadPose.caps).
+enum MonoXrLayerCaps {
+    MONOXR_CAP_KNOWN    = 1,   // the layer has filled the rest in
+    MONOXR_CAP_CYLINDER = 2,   // XR_KHR_composition_layer_cylinder is on: curved overlays are possible
 };
 
 // What the layer knows about eye tracking (MonoXrEyeGaze.state).
@@ -98,6 +104,25 @@ struct MonoXrEyeGaze {
     float quatX, quatY, quatZ, quatW;
 };
 
+// EXPERIMENTAL head-tracking filter. The layer applies it to the view poses the
+// game gets back from xrLocateViews (the overlays and the published head pose
+// keep using the real, unfiltered tracking). The client writes it; the layer
+// ignores it while the client's heartbeat has stopped.
+enum MonoXrTrackingFlags {
+    MONOXR_TRACK_SMOOTH  = 1,   // low-pass the pose by `smoothing`
+    MONOXR_TRACK_MINMOVE = 2,   // hold still until it moves further than the minimums
+    MONOXR_TRACK_LOCKPOS = 4,   // keep only the rotation; put the head at `lock`
+};
+
+struct MonoXrTrackingControl {
+    uint32_t flags;             // MonoXrTrackingFlags
+    float smoothing;            // 0..1: 0 = none, 1 = heaviest (about a quarter second)
+    float minMovePosMm;         // position must move at least this far (millimetres)
+    float minMoveRotDeg;        // rotation must move at least this far (degrees)
+    float lockX, lockY, lockZ;  // where LOCAL space puts the head when LOCKPOS is on (meters)
+    uint32_t _pad0;
+};
+
 struct MonoXrControlBlock {
     uint32_t magic;         // MONOXR_MAGIC
     uint32_t version;       // MONOXR_VERSION
@@ -117,6 +142,9 @@ struct MonoXrControlBlock {
     // After the head pose for the same reason: a layer or client without it
     // maps the smaller block and simply never sees eye gaze.
     struct MonoXrEyeGaze eyeGaze;
+
+    // After the eye gaze for the same reason.
+    struct MonoXrTrackingControl tracking;
 };
 
 #pragma pack(pop)
@@ -130,7 +158,9 @@ static_assert(offsetof(MonoXrControlBlock, slots) == 32, "header must match Mono
 static_assert(offsetof(MonoXrControlBlock, headPose) == 3296, "headPose must match MonoXrAbi.cs HeadPoseOffset");
 static_assert(sizeof(MonoXrEyeGaze) == 40, "MonoXrEyeGaze must match MonoXrAbi.cs EyeGazeSize");
 static_assert(offsetof(MonoXrControlBlock, eyeGaze) == 3336, "eyeGaze must match MonoXrAbi.cs EyeGazeOffset");
-static_assert(sizeof(MonoXrControlBlock) == 3376, "MonoXrControlBlock must match MonoXrAbi.cs ControlSize");
+static_assert(sizeof(MonoXrTrackingControl) == 32, "MonoXrTrackingControl must match MonoXrAbi.cs TrackingSize");
+static_assert(offsetof(MonoXrControlBlock, tracking) == 3376, "tracking must match MonoXrAbi.cs TrackingOffset");
+static_assert(sizeof(MonoXrControlBlock) == 3408, "MonoXrControlBlock must match MonoXrAbi.cs ControlSize");
 #endif
 
 // Keyed-mutex handshake on each shared texture:

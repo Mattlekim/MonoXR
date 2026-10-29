@@ -12,6 +12,7 @@
 #include <d3d11_1.h>
 #include <dxgi1_2.h>
 
+#include <cmath>
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
@@ -114,6 +115,7 @@ static PFN_xrEndFrame                    down_xrEndFrame = nullptr;
 static PFN_xrCreateReferenceSpace        down_xrCreateReferenceSpace = nullptr;
 static PFN_xrDestroySpace                down_xrDestroySpace = nullptr;
 static PFN_xrLocateSpace                 down_xrLocateSpace = nullptr;
+static PFN_xrLocateViews                 down_xrLocateViews = nullptr;
 static PFN_xrEnumerateSwapchainFormats   down_xrEnumerateSwapchainFormats = nullptr;
 static PFN_xrCreateSwapchain             down_xrCreateSwapchain = nullptr;
 static PFN_xrDestroySwapchain            down_xrDestroySwapchain = nullptr;
@@ -182,6 +184,7 @@ struct SessionState {
     MonoXrControlBlock* control = nullptr;
     bool controlHasHeadPose = false;        // mapping is big enough for control->headPose
     bool controlHasEyeGaze = false;         // ... and for control->eyeGaze
+    bool controlHasTracking = false;        // ... and for control->tracking
     int openRetry = 0;
 
     // Eye gaze. gazeSupported: the system reports eye gaze interaction and our
@@ -218,18 +221,21 @@ static void TryOpenControl(SessionState& s) {
 
     HANDLE h = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, MONOXR_CONTROL_NAME);
     if (!h) return;
-    // A client that predates the head-pose block created a smaller mapping;
-    // fall back to the original size and just don't publish the pose.
-    // Likewise for eye gaze, which sits after the head pose.
-    bool hasHeadPose = true;
-    bool hasEyeGaze = true;
+    // A client that predates the head-pose, eye gaze or tracking blocks created a
+    // smaller mapping; fall back to the size it has and just don't use the block.
+    // (A view bigger than the mapping fails to map.)
+    bool hasHeadPose = true, hasEyeGaze = true, hasTracking = true;
     void* view = MapViewOfFile(h, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(MonoXrControlBlock));
     if (!view) {
-        hasEyeGaze = false;
+        hasTracking = false;
+        view = MapViewOfFile(h, FILE_MAP_ALL_ACCESS, 0, 0, offsetof(MonoXrControlBlock, tracking));
+    }
+    if (!view) {
+        hasTracking = hasEyeGaze = false;
         view = MapViewOfFile(h, FILE_MAP_ALL_ACCESS, 0, 0, offsetof(MonoXrControlBlock, eyeGaze));
     }
     if (!view) {
-        hasHeadPose = false;
+        hasTracking = hasEyeGaze = hasHeadPose = false;
         view = MapViewOfFile(h, FILE_MAP_ALL_ACCESS, 0, 0, offsetof(MonoXrControlBlock, headPose));
     }
     if (!view) { CloseHandle(h); return; }
@@ -243,6 +249,7 @@ static void TryOpenControl(SessionState& s) {
     s.control = cb;
     s.controlHasHeadPose = hasHeadPose;
     s.controlHasEyeGaze = hasEyeGaze;
+    s.controlHasTracking = hasTracking;
     s.control->layerPid = GetCurrentProcessId();
     s.control->layerActive = 1;
     LogLine("attached to MonoXR control block, client pid=%u", cb->clientPid);
@@ -431,12 +438,182 @@ static void PublishHeadPose(SessionState& s, XrTime displayTime) {
 
 // True while the client is alive (its heartbeat moved within the last couple of
 // seconds) and has asked for eye gaze.
-static bool EyeGazeRequested(SessionState& s) {
-    if (!s.control || !s.controlHasEyeGaze || !s.control->eyeGaze.request) return false;
+static bool ClientAlive(SessionState& s) {
     ULONGLONG now = GetTickCount64();
     uint64_t hb = s.control->clientHeartbeat;
     if (hb != s.lastHeartbeat) { s.lastHeartbeat = hb; s.lastHeartbeatTick = now; }
     return now - s.lastHeartbeatTick < 2000;
+}
+
+static bool EyeGazeRequested(SessionState& s) {
+    if (!s.control || !s.controlHasEyeGaze || !s.control->eyeGaze.request) return false;
+    return ClientAlive(s);
+}
+
+// ---------------------------------------------------------------------------
+// Head-tracking filter (EXPERIMENTAL). Hooks xrLocateViews: the game's view
+// poses are replaced by a smoothed / dead-banded / position-locked version of
+// the real head pose. Nothing else is touched - the overlays, the published
+// head pose and the gaze all keep using the real tracking.
+// ---------------------------------------------------------------------------
+namespace trk {
+struct V3 { float x, y, z; };
+struct Q4 { float x, y, z, w; };
+
+static V3 operator+(V3 a, V3 b) { return { a.x + b.x, a.y + b.y, a.z + b.z }; }
+static V3 operator-(V3 a, V3 b) { return { a.x - b.x, a.y - b.y, a.z - b.z }; }
+static V3 operator*(V3 a, float f) { return { a.x * f, a.y * f, a.z * f }; }
+static float len(V3 a) { return sqrtf(a.x * a.x + a.y * a.y + a.z * a.z); }
+static V3 cross(V3 a, V3 b) { return { a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x }; }
+static V3 lerp(V3 a, V3 b, float t) { return a + (b - a) * t; }
+
+static Q4 mul(Q4 a, Q4 b) {
+    return { a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+             a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+             a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
+             a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z };
+}
+static Q4 inv(Q4 q) { return { -q.x, -q.y, -q.z, q.w }; }   // unit quaternions only
+static Q4 norm(Q4 q) {
+    float n = sqrtf(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w);
+    return n > 1e-6f ? Q4{ q.x / n, q.y / n, q.z / n, q.w / n } : Q4{ 0, 0, 0, 1 };
+}
+static V3 rotate(Q4 q, V3 v) {
+    V3 u{ q.x, q.y, q.z };
+    V3 t = cross(u, v) * 2.0f;
+    return v + t * q.w + cross(u, t);
+}
+static float dot(Q4 a, Q4 b) { return a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w; }
+static Q4 slerp(Q4 a, Q4 b, float t) {
+    float d = dot(a, b);
+    if (d < 0.0f) { b = { -b.x, -b.y, -b.z, -b.w }; d = -d; }
+    if (d > 0.9995f)
+        return norm({ a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t, a.z + (b.z - a.z) * t, a.w + (b.w - a.w) * t });
+    float th = acosf(d), sn = sinf(th);
+    float wa = sinf((1.0f - t) * th) / sn, wb = sinf(t * th) / sn;
+    return norm({ a.x * wa + b.x * wb, a.y * wa + b.y * wb, a.z * wa + b.z * wb, a.w * wa + b.w * wb });
+}
+static float angleBetween(Q4 a, Q4 b) { return 2.0f * acosf(fminf(1.0f, fabsf(dot(a, b)))); }
+} // namespace trk
+
+static std::mutex g_trackLock;
+static MonoXrTrackingControl g_trackCfg = {};   // what the client asked for (all off = pass through)
+static XrSession g_trackSession = XR_NULL_HANDLE;
+static XrSpace   g_trackWorld = XR_NULL_HANDLE; // LOCAL, for the lock point
+
+// The filter's memory between xrLocateViews calls.
+static struct {
+    bool init = false;
+    XrTime time = 0;
+    XrSpace space = XR_NULL_HANDLE;
+    trk::V3 heldP{}, outP{};
+    trk::Q4 heldR{ 0, 0, 0, 1 }, outR{ 0, 0, 0, 1 };
+} g_track;
+
+// Called once a frame from xrEndFrame: hand the filter the client's current
+// settings (off while there is no live client).
+static void PublishTrackingConfig(SessionState& s) {
+    MonoXrTrackingControl cfg = {};
+    if (s.control && s.controlHasTracking && ClientAlive(s)) cfg = s.control->tracking;
+    std::lock_guard<std::mutex> guard(g_trackLock);
+    if (cfg.flags != g_trackCfg.flags) {
+        LogLine("head tracking filter flags -> %u (1 smooth, 2 min movement, 4 lock position)", cfg.flags);
+        g_track.init = false;
+    }
+    g_trackCfg = cfg;
+    g_trackSession = s.session;
+    g_trackWorld = s.worldSpace;
+}
+
+static XrResult XRAPI_CALL MonoXr_xrLocateViews(XrSession session, const XrViewLocateInfo* info,
+                                                XrViewState* state, uint32_t capacity,
+                                                uint32_t* countOut, XrView* views) {
+    XrResult res = down_xrLocateViews(session, info, state, capacity, countOut, views);
+    if (XR_FAILED(res) || !info || !state || !countOut || !views || *countOut == 0) return res;
+    const XrViewStateFlags need = XR_VIEW_STATE_POSITION_VALID_BIT | XR_VIEW_STATE_ORIENTATION_VALID_BIT;
+    if ((state->viewStateFlags & need) != need) return res;
+
+    std::lock_guard<std::mutex> guard(g_trackLock);
+    const MonoXrTrackingControl& cfg = g_trackCfg;
+    const bool smooth = (cfg.flags & MONOXR_TRACK_SMOOTH) && cfg.smoothing > 0.001f;
+    const bool dead = (cfg.flags & MONOXR_TRACK_MINMOVE) != 0;
+    const bool lock = (cfg.flags & MONOXR_TRACK_LOCKPOS) != 0;
+    if (session != g_trackSession || !(smooth || dead || lock)) { g_track.init = false; return res; }
+
+    using namespace trk;
+    const uint32_t n = *countOut;
+
+    // The real head: the middle of the eyes, looking the way the first eye does.
+    V3 rawP{ 0, 0, 0 };
+    for (uint32_t i = 0; i < n; ++i)
+        rawP = rawP + V3{ views[i].pose.position.x, views[i].pose.position.y, views[i].pose.position.z };
+    rawP = rawP * (1.0f / n);
+    const Q4 rawR = norm({ views[0].pose.orientation.x, views[0].pose.orientation.y,
+                           views[0].pose.orientation.z, views[0].pose.orientation.w });
+
+    auto& st = g_track;
+    const XrTime t = info->displayTime;
+    const bool restart = !st.init || st.space != info->space || t < st.time || t - st.time > 500000000;
+    if (restart) {
+        st.init = true; st.space = info->space; st.time = t;
+        st.heldP = st.outP = rawP;
+        st.heldR = st.outR = rawR;
+    } else if (t != st.time) {
+        // Minimum movement: stay put until the real head is further than the
+        // threshold from where we are holding, then trail it by exactly that much
+        // so there is no jump.
+        if (dead) {
+            const float thrP = fmaxf(0.0f, cfg.minMovePosMm) * 0.001f;
+            V3 d = rawP - st.heldP;
+            float dist = len(d);
+            if (dist > thrP) st.heldP = rawP - d * (thrP / dist);
+
+            const float thrR = fmaxf(0.0f, cfg.minMoveRotDeg) * 0.01745329f;
+            float ang = angleBetween(st.heldR, rawR);
+            if (ang > thrR) st.heldR = slerp(rawR, st.heldR, thrR / ang);
+        } else {
+            st.heldP = rawP;
+            st.heldR = rawR;
+        }
+
+        // Smoothing: ease the output toward the held pose. Time based, so it
+        // feels the same at any frame rate; the heaviest setting is ~0.25 s.
+        if (smooth) {
+            float dt = fminf(0.1f, fmaxf(0.001f, (float)(t - st.time) * 1e-9f));
+            float tau = fminf(1.0f, cfg.smoothing) * 0.25f;
+            float a = 1.0f - expf(-dt / tau);
+            st.outP = lerp(st.outP, st.heldP, a);
+            st.outR = slerp(st.outR, st.heldR, a);
+        } else {
+            st.outP = st.heldP;
+            st.outR = st.heldR;
+        }
+        st.time = t;
+    }
+
+    V3 outP = st.outP;
+    if (lock && g_trackWorld) {
+        // The lock point is in LOCAL space; the game may be asking in another.
+        XrSpaceLocation loc{ XR_TYPE_SPACE_LOCATION };
+        const XrSpaceLocationFlags ok = XR_SPACE_LOCATION_POSITION_VALID_BIT | XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
+        if (XR_SUCCEEDED(down_xrLocateSpace(g_trackWorld, info->space, t, &loc)) && (loc.locationFlags & ok) == ok) {
+            Q4 lq = norm({ loc.pose.orientation.x, loc.pose.orientation.y, loc.pose.orientation.z, loc.pose.orientation.w });
+            outP = V3{ loc.pose.position.x, loc.pose.position.y, loc.pose.position.z } +
+                   rotate(lq, V3{ cfg.lockX, cfg.lockY, cfg.lockZ });
+        }
+    }
+
+    // Move every eye by the same correction, so the eye separation and any
+    // canting of the displays are kept.
+    const Q4 dR = mul(st.outR, inv(rawR));
+    for (uint32_t i = 0; i < n; ++i) {
+        XrPosef& p = views[i].pose;
+        V3 pos = outP + rotate(dR, V3{ p.position.x, p.position.y, p.position.z } - rawP);
+        Q4 q = norm(mul(dR, Q4{ p.orientation.x, p.orientation.y, p.orientation.z, p.orientation.w }));
+        p.position = { pos.x, pos.y, pos.z };
+        p.orientation = { q.x, q.y, q.z, q.w };
+    }
+    return res;
 }
 
 // Publish the eye gaze ray (same seqlock as the head pose) and what the layer
@@ -507,8 +684,11 @@ static XrResult XRAPI_CALL MonoXr_xrEndFrame(XrSession session, const XrFrameEnd
     s.control->layerActive = 1;
     s.control->layerPid = GetCurrentProcessId();
 
+    if (s.controlHasHeadPose)
+        s.control->headPose.caps = MONOXR_CAP_KNOWN | (g_cylinderExtEnabled ? MONOXR_CAP_CYLINDER : 0);
     PublishHeadPose(s, frameEndInfo->displayTime);
     PublishEyeGaze(s, frameEndInfo->displayTime);
+    PublishTrackingConfig(s);
 
     // Storage must outlive the down-call; reserve so pointers stay stable.
     static std::vector<XrCompositionLayerQuad> quads;
@@ -537,7 +717,8 @@ static XrResult XRAPI_CALL MonoXr_xrEndFrame(XrSession session, const XrFrameEnd
         if (!RenderSlot(s, r, slot, sub)) continue;
 
         // A curved overlay goes out as a cylinder layer when the runtime has them;
-        // otherwise it stays the flat quad it always was.
+        // otherwise it stays the flat quad it always was (the client knows from
+        // MonoXrHeadPose.caps and does not offer curving then).
         if (g_cylinderExtEnabled && slot.curveRadius > 0.05f && slot.sizeX > 0.0f && slot.sizeY > 0.0f) {
             XrCompositionLayerCylinderKHR c{ XR_TYPE_COMPOSITION_LAYER_CYLINDER_KHR };
             c.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT |
@@ -815,6 +996,13 @@ static XrResult XRAPI_CALL MonoXr_xrDestroySession(XrSession session) {
             if (r.swapchain != XR_NULL_HANDLE) down_xrDestroySwapchain(r.swapchain);
             r.releaseShared();
         }
+        {
+            std::lock_guard<std::mutex> trackGuard(g_trackLock);
+            g_trackCfg = {};
+            g_trackSession = XR_NULL_HANDLE;
+            g_trackWorld = XR_NULL_HANDLE;
+            g_track.init = false;
+        }
         if (s.worldSpace) down_xrDestroySpace(s.worldSpace);
         if (s.headSpace) down_xrDestroySpace(s.headSpace);
         if (s.gazeSpace) down_xrDestroySpace(s.gazeSpace);
@@ -850,6 +1038,7 @@ static XrResult XRAPI_CALL MonoXr_xrGetInstanceProcAddr(XrInstance instance, con
     if (strcmp(name, "xrCreateSession") == 0)  return give((void*)MonoXr_xrCreateSession);
     if (strcmp(name, "xrDestroySession") == 0) return give((void*)MonoXr_xrDestroySession);
     if (strcmp(name, "xrEndFrame") == 0)       return give((void*)MonoXr_xrEndFrame);
+    if (strcmp(name, "xrLocateViews") == 0 && down_xrLocateViews) return give((void*)MonoXr_xrLocateViews);
     if (strcmp(name, "xrAttachSessionActionSets") == 0)
         return give((void*)MonoXr_xrAttachSessionActionSets);
     if (strcmp(name, "xrSyncActions") == 0)    return give((void*)MonoXr_xrSyncActions);
@@ -954,6 +1143,7 @@ static XrResult XRAPI_CALL MonoXr_xrCreateApiLayerInstance(const XrInstanceCreat
     RESOLVE(xrCreateReferenceSpace);
     RESOLVE(xrDestroySpace);
     RESOLVE(xrLocateSpace);
+    RESOLVE(xrLocateViews);
     RESOLVE(xrEnumerateSwapchainFormats);
     RESOLVE(xrCreateSwapchain);
     RESOLVE(xrDestroySwapchain);

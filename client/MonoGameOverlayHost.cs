@@ -176,7 +176,7 @@ namespace MonoXR.Client
         public Vector2 DisplaySize
         {
             get => _overlay.Size;
-            set { _overlay.Size = value; _canvasDirty = true; }
+            set { _overlay.Size = value; ApplyPose(); }
         }
 
         /// <summary>
@@ -218,16 +218,28 @@ namespace MonoXR.Client
         /// <see cref="Distance"/> / <see cref="CurveAmount"/>, <see cref="DisplaySize"/>
         /// is the arc length and height, and <see cref="OffsetX"/> then slides
         /// the overlay around the cylinder (as an arc) rather than sideways.
-        /// Needs a runtime with cylinder layers; the OpenXR layer draws it flat
-        /// without one.
+        /// Needs a runtime with cylinder layers: reads false (flat) while the
+        /// layer has reported that the runtime has none, see
+        /// <see cref="CurvedSupported"/>.
         /// </summary>
         public bool Curved
         {
-            get => _curved;
+            get => _curved && CurvedSupported != false;
             set { _curved = value; ApplyPose(); }
         }
 
+        /// <summary>What was last asked for, whether or not the runtime can show it.</summary>
+        public bool CurvedRequested => _curved;
+
+        /// <summary>
+        /// Whether the headset runtime can draw curved overlays: null until the
+        /// layer has said (no OpenXR app attached yet), so callers should only
+        /// refuse <see cref="Curved"/> on an explicit false.
+        /// </summary>
+        public bool? CurvedSupported => _disposed ? null : _mgr.CylinderLayersSupported;
+
         private bool _curved;
+        private bool _appliedCurved;
 
         /// <summary>
         /// How strongly a <see cref="Curved"/> overlay bends, 0.1 to 1.5. 1 is
@@ -242,6 +254,91 @@ namespace MonoXR.Client
         }
 
         private float _curveAmount = 1f;
+
+        /// <summary>
+        /// Split the overlay into three flat screens, like a triple monitor
+        /// setup: the canvas is cut into a left, a centre and a right part, each
+        /// shown on its own quad. <see cref="DisplaySize"/> is the width of the
+        /// three laid side by side, <see cref="TripleCenterPercent"/> how much of
+        /// it the centre takes, and the two outer screens are turned in toward
+        /// the viewer by <see cref="TripleSideAngle"/>. Takes the place of
+        /// <see cref="Curved"/> while on.
+        /// </summary>
+        public bool Triple
+        {
+            get => _triple;
+            set { _triple = value; ApplyPose(); }
+        }
+
+        /// <summary>Width of the centre screen as a percentage of the whole canvas, 20 to 90. The outer screens share the rest equally.</summary>
+        public float TripleCenterPercent
+        {
+            get => _tripleCenter;
+            set { _tripleCenter = Math.Clamp(value, 20f, 90f); ApplyPose(); }
+        }
+
+        /// <summary>How far the outer screens are turned in toward the viewer, in degrees: 0 keeps all three in one flat line, 90 sets them side-on.</summary>
+        public float TripleSideAngle
+        {
+            get => _tripleAngle;
+            set { _tripleAngle = Math.Clamp(value, 0f, 90f); ApplyPose(); }
+        }
+
+        private bool _triple, _appliedTriple;
+        private float _tripleCenter = 50f, _tripleAngle = 30f;
+        private Overlay[]? _tripleOverlays; // left, centre, right; only while Triple is on
+
+        // One screen of the triple layout: the canvas columns it shows, its
+        // width in meters, and where it sits in the view origin's frame (a yaw
+        // about its own up axis; positive turns it toward +X).
+        private readonly record struct TripleSegment(int X0, int Px, float WidthM, float Yaw, Vector3 Center);
+
+        private TripleSegment[] TripleLayout()
+        {
+            Vector2 size = _overlay.Size;
+            int w = CanvasWidth;
+            int centerPx = Math.Clamp((int)MathF.Round(w * _tripleCenter / 100f), 1, Math.Max(1, w - 2));
+            int leftPx = (w - centerPx) / 2, rightPx = w - centerPx - leftPx;
+
+            float perPx = size.X / w; // every screen shows the canvas at the same scale
+            float cm = centerPx * perPx, lm = leftPx * perPx, rm = rightPx * perPx;
+            float angle = _tripleAngle * MathF.PI / 180f, sin = MathF.Sin(angle), cos = MathF.Cos(angle);
+            float z = -_distance;
+
+            // The centre faces straight ahead. Each outer screen hinges on a
+            // centre edge and swings toward the viewer (+Z) by the angle.
+            return new[]
+            {
+                new TripleSegment(0, leftPx, lm, angle,
+                    new Vector3(_offsetX - cm / 2f - lm / 2f * cos, _offsetY, z + lm / 2f * sin)),
+                new TripleSegment(leftPx, centerPx, cm, 0f, new Vector3(_offsetX, _offsetY, z)),
+                new TripleSegment(leftPx + centerPx, rightPx, rm, -angle,
+                    new Vector3(_offsetX + cm / 2f + rm / 2f * cos, _offsetY, z + rm / 2f * sin)),
+            };
+        }
+
+        // Make sure the three overlays exist and match the layout's pixel slices.
+        private void EnsureTriple(TripleSegment[] segs)
+        {
+            int h = CanvasHeight;
+            if (_tripleOverlays != null)
+            {
+                bool same = true;
+                for (int i = 0; i < 3; i++)
+                    same &= _tripleOverlays[i].Width == segs[i].Px && _tripleOverlays[i].Height == h;
+                if (same) return;
+                DisposeTriple();
+            }
+            _tripleOverlays = new Overlay[3];
+            for (int i = 0; i < 3; i++) _tripleOverlays[i] = _mgr.CreateOverlay(segs[i].Px, h);
+        }
+
+        private void DisposeTriple()
+        {
+            if (_tripleOverlays == null) return;
+            foreach (var o in _tripleOverlays) o.Dispose();
+            _tripleOverlays = null;
+        }
 
         // Radius of the cylinder, and where its vertical axis sits: forward of
         // the view origin by (distance - radius), so the surface is always
@@ -299,7 +396,34 @@ namespace MonoXR.Client
         {
             // Yaw then pitch, no roll: forward = (-cos p * sin y, sin p, -cos p * cos y).
             var rotation = Quaternion.CreateFromYawPitchRoll(OriginYaw, OriginPitch, 0f);
-            if (_curved)
+            _appliedTriple = _triple;
+            if (_appliedTriple)
+            {
+                // Three flat screens; the single canvas overlay is hidden and
+                // not published while they are up.
+                _appliedCurved = false;
+                var segs = TripleLayout();
+                EnsureTriple(segs);
+                for (int i = 0; i < 3; i++)
+                {
+                    var o = _tripleOverlays![i];
+                    o.Space = _overlay.Space;
+                    o.Rotation = rotation * Quaternion.CreateFromAxisAngle(Vector3.UnitY, segs[i].Yaw);
+                    o.Position = OriginPosition + Vector3.Transform(segs[i].Center, rotation);
+                    o.Size = new Vector2(segs[i].WidthM, _overlay.Size.Y);
+                    o.CurveRadius = 0f;
+                    o.ZOrder = _overlay.ZOrder;
+                    o.Visible = true;
+                }
+                _overlay.Visible = false;
+                _overlay.UpdatePose();
+                _canvasDirty = true;
+                return;
+            }
+            DisposeTriple();
+            _overlay.Visible = true;
+            _appliedCurved = Curved;
+            if (_appliedCurved)
             {
                 // Slide around the cylinder by the offset's arc length, facing the axis.
                 float radius = CurveRadius;
@@ -340,6 +464,22 @@ namespace MonoXR.Client
             get => !_disposed && _mgr.EyeGazeRequested;
             set { if (!_disposed) _mgr.EyeGazeRequested = value; }
         }
+
+        /// <summary>
+        /// EXPERIMENTAL: filter the head pose the game receives (smoothing, minimum
+        /// movement, locked position). Needs a game running with the updated layer.
+        /// </summary>
+        public HeadTrackingSettings HeadTracking
+        {
+            get => _headTracking;
+            set
+            {
+                _headTracking = value;
+                if (!_disposed) _mgr.SetHeadTracking(value);
+            }
+        }
+
+        private HeadTrackingSettings _headTracking;
 
         /// <summary>What the layer reports about eye tracking (see <see cref="MonoXrGazeState"/>).</summary>
         public MonoXrGazeState EyeGazeState => _disposed ? MonoXrGazeState.Unknown : _mgr.EyeGazeState;
@@ -385,7 +525,8 @@ namespace MonoXR.Client
             // _distance along the origin's look direction, its own +X to the
             // right, +Y up and +Z back out toward the user.
             var quad = Quaternion.CreateFromYawPitchRoll(OriginYaw, OriginPitch, 0f);
-            if (_curved) return CanvasPointOfRayCurved(eye, head, quad, size, out x, out y);
+            if (_appliedTriple) return CanvasPointOfRayTriple(eye, head, quad, size, out x, out y);
+            if (_appliedCurved) return CanvasPointOfRayCurved(eye, head, quad, size, out x, out y);
 
             Vector3 center = OriginPosition + Vector3.Transform(new Vector3(_offsetX, _offsetY, -_distance), quad);
             Vector3 right = Vector3.Transform(Vector3.UnitX, quad);
@@ -408,6 +549,68 @@ namespace MonoXR.Client
             x = (Vector3.Dot(local, right) / size.X + 0.5f) * CanvasWidth;
             y = (0.5f - Vector3.Dot(local, up) / size.Y) * CanvasHeight;
             return float.IsFinite(x) && float.IsFinite(y);
+        }
+
+        // The same, for the triple layout: the nearest of the three screens the
+        // ray lands inside. A ray that misses all of them (above, below or
+        // beside) gets the centre screen's plane extended, so the point still
+        // lies outside the canvas.
+        private bool CanvasPointOfRayTriple(Vector3 eye, Quaternion head, Quaternion frame, Vector2 size,
+                                            out float x, out float y)
+        {
+            x = 0f;
+            y = 0f;
+
+            Vector3 look = Vector3.Transform(-Vector3.UnitZ, head);
+            float lookLen = look.Length();
+            if (!(lookLen > 1e-4f)) return false;
+            look /= lookLen;
+
+            var segs = TripleLayout();
+            float bestT = float.MaxValue;
+            bool found = false;
+            for (int i = 0; i < 3; i++)
+            {
+                if (!TryHitScreen(segs[i], eye, look, frame, size, out float t, out float lx, out float ly)) continue;
+                bool inside = MathF.Abs(lx) <= segs[i].WidthM / 2f && MathF.Abs(ly) <= size.Y / 2f;
+                if (inside && t < bestT)
+                {
+                    bestT = t;
+                    found = true;
+                    x = segs[i].X0 + (lx / segs[i].WidthM + 0.5f) * segs[i].Px;
+                    y = (0.5f - ly / size.Y) * CanvasHeight;
+                }
+            }
+            if (!found)
+            {
+                if (!TryHitScreen(segs[1], eye, look, frame, size, out _, out float lx, out float ly)) return false;
+                x = segs[1].X0 + (lx / segs[1].WidthM + 0.5f) * segs[1].Px;
+                y = (0.5f - ly / size.Y) * CanvasHeight;
+            }
+            return float.IsFinite(x) && float.IsFinite(y);
+        }
+
+        // Ray/plane intersection with one screen: distance along the ray and the
+        // hit in the screen's own right/up axes, relative to its centre.
+        private bool TryHitScreen(TripleSegment seg, Vector3 eye, Vector3 look, Quaternion frame, Vector2 size,
+                                  out float t, out float lx, out float ly)
+        {
+            t = lx = ly = 0f;
+            Quaternion rot = frame * Quaternion.CreateFromAxisAngle(Vector3.UnitY, seg.Yaw);
+            Vector3 center = OriginPosition + Vector3.Transform(seg.Center, frame);
+            Vector3 right = Vector3.Transform(Vector3.UnitX, rot);
+            Vector3 up = Vector3.Transform(Vector3.UnitY, rot);
+            Vector3 normal = Vector3.Transform(Vector3.UnitZ, rot);
+
+            float denom = Vector3.Dot(look, normal);
+            if (MathF.Abs(denom) < 1e-4f) return false;
+            t = Vector3.Dot(center - eye, normal) / denom;
+            if (t <= 0f) return false; // behind the head
+
+            Vector3 local = eye + look * t - center;
+            lx = Vector3.Dot(local, right);
+            ly = Vector3.Dot(local, up);
+            return true;
         }
 
         // The same, for the curved overlay: intersect the ray with the cylinder
@@ -485,7 +688,7 @@ namespace MonoXR.Client
                 if (_editMode == value) return;
                 _editMode = value;
                 _canvasDirty = true;
-                if (!value) { _selected = null; _group.Clear(); _marquee = false; _groupDrag = false; }
+                if (!value) { _selected = null; _group.Clear(); _marquee = false; _groupDrag = false; _showMenuOpen = false; }
                 EditModeChanged?.Invoke(value);
                 // Let targets react (e.g. draw a placeholder while edited).
                 foreach (var rt in _targets)
@@ -572,8 +775,8 @@ namespace MonoXR.Client
         private const int EditIconBtnWidth = 64;    // Collapse / Expand chevron, Bind gamepad, gaze eye
         private const int EditOpacityBtnWidth = 130; // opacity icon + "100%"
         private const float EditOpacityStep = 0.1f;
-        private const int EditShowChipPad = 28;      // text padding inside a Show chip
-        private const int EditShowChipGap = 4;
+        private const int EditShowChipPad = 28;      // text padding inside a Show dropdown row
+        private const int EditShowButtonWidth = 300; // the closed Show dropdown button
         private const int ResizeGripSize = 30;
 
         /// <summary>
@@ -1051,6 +1254,11 @@ namespace MonoXR.Client
                     _lmbWasDown = lmb;
                     return;
                 }
+                if (_showMenuOpen && HandleShowMenuClick(mx, my))
+                {
+                    _lmbWasDown = lmb;
+                    return;
+                }
                 if (!HandleHiddenShowClick(mx, my) && !HandleEditButtonClick(mx, my))
                 {
                     // A hidden target's pill is drawn above every panel, so it
@@ -1437,7 +1645,7 @@ namespace MonoXR.Client
                      + EditStepBtnWidth * 2 + EditOpacityBtnWidth + EditBtnGap * 2
                      + (hasGaze ? EditIconBtnWidth + EditBtnGap : 0)
                      + (hasBind ? bindW + EditBtnGap : 0)
-                     + (hasShow ? GetShowChipsWidth(rt) + EditBtnGap : 0);
+                     + (hasShow ? EditShowButtonWidth + EditBtnGap : 0);
             int bx = Math.Clamp(rt.X, 0, Math.Max(0, CanvasWidth - barW));
 
             XnaRectangle Next(int width)
@@ -1453,7 +1661,7 @@ namespace MonoXR.Client
                     Next(EditStepBtnWidth), Next(EditOpacityBtnWidth), Next(EditStepBtnWidth),
                     hasGaze ? Next(EditIconBtnWidth) : XnaRectangle.Empty,
                     hasBind ? Next(bindW) : XnaRectangle.Empty,
-                    hasShow ? Next(GetShowChipsWidth(rt)) : XnaRectangle.Empty);
+                    hasShow ? Next(EditShowButtonWidth) : XnaRectangle.Empty);
         }
 
         /// <summary>
@@ -1471,31 +1679,79 @@ namespace MonoXR.Client
             return label.StartsWith(lead, StringComparison.OrdinalIgnoreCase) ? label.Substring(lead.Length).Trim() : label;
         }
 
-        private int GetShowChipWidth(string label) =>
-            EditFont == null ? 80 : (int)MathF.Ceiling(EditFont.MeasureString(label).X) + EditShowChipPad;
+        // The Show setting is one dropdown button on the bar ("Show: Practice, Race")
+        // that opens a list with a row per choice (All, then each session type).
+        // Rows toggle on click and the list stays open, so several can be ticked;
+        // a click anywhere else closes it. It belongs to the selected target.
+        private bool _showMenuOpen;
 
-        private int GetShowChipsWidth(OverlayRenderTarget rt)
+        /// <summary>The closed button's text: "Show: All", or the ticked session types.</summary>
+        private string GetShowSummary(OverlayRenderTarget rt)
         {
             var chips = ShowChips!(rt);
-            int w = 0;
-            for (int i = 0; i < chips.Count; i++)
-                w += GetShowChipWidth(chips[i].Label) + (i > 0 ? EditShowChipGap : 0);
-            return w;
+            string text;
+            if (chips.Count == 0 || chips[0].On) text = "All";
+            else
+            {
+                var on = new List<string>();
+                for (int i = 1; i < chips.Count; i++) if (chips[i].On) on.Add(chips[i].Label);
+                text = on.Count == 0 ? "All" : string.Join(", ", on);
+            }
+            text = "Show: " + text;
+
+            // Ellipsize to fit the button, leaving room for the arrow.
+            if (EditFont == null) return text;
+            float max = EditShowButtonWidth - EditShowChipPad - 30;
+            if (EditFont.MeasureString(text).X <= max) return text;
+            while (text.Length > 1 && EditFont.MeasureString(text + "...").X > max)
+                text = text.Substring(0, text.Length - 1);
+            return text.TrimEnd() + "...";
         }
 
-        /// <summary>Each Show chip's rectangle, laid left to right inside the bar's <paramref name="show"/> rectangle.</summary>
-        private List<XnaRectangle> GetShowChipRects(OverlayRenderTarget rt, XnaRectangle show)
+        /// <summary>The open list: one row per choice, below the button (above it when there is no room).</summary>
+        private List<XnaRectangle> GetShowMenuRects(OverlayRenderTarget rt, XnaRectangle show)
         {
             var chips = ShowChips!(rt);
+            int rowH = EditBtnHeight, gap = 4;
+            int width = show.Width;
+            if (EditFont != null)
+                foreach (var chip in chips)
+                    width = Math.Max(width, (int)MathF.Ceiling(EditFont.MeasureString(chip.Label).X) + EditShowChipPad + 40);
+            int height = chips.Count * rowH + (chips.Count - 1) * gap;
+
+            int x = Math.Clamp(show.X, 0, Math.Max(0, CanvasWidth - width));
+            int y = show.Bottom + 6;
+            if (y + height > CanvasHeight) y = Math.Max(0, show.Y - 6 - height);
+
             var rects = new List<XnaRectangle>(chips.Count);
-            int x = show.X;
-            foreach (var chip in chips)
-            {
-                int w = GetShowChipWidth(chip.Label);
-                rects.Add(new XnaRectangle(x, show.Y, w, show.Height));
-                x += w + EditShowChipGap;
-            }
+            for (int i = 0; i < chips.Count; i++)
+                rects.Add(new XnaRectangle(x, y + i * (rowH + gap), width, rowH));
             return rects;
+        }
+
+        /// <summary>The target whose Show list is open, or null.</summary>
+        private OverlayRenderTarget? ShowMenuTarget =>
+            _showMenuOpen && EditMode && _selected is { Visible: true } t && ShowChips != null && !t.EditModeOnly ? t : null;
+
+        /// <summary>Press while the Show list is open: toggle the row hit, or close it when the press is elsewhere. True when the press was used.</summary>
+        private bool HandleShowMenuClick(int mx, int my)
+        {
+            var rt = ShowMenuTarget;
+            if (rt == null) { _showMenuOpen = false; return false; }
+
+            var show = GetEditButtons(rt).Show;
+            var rects = GetShowMenuRects(rt, show);
+            for (int i = 0; i < rects.Count; i++)
+            {
+                if (!rects[i].Contains(mx, my)) continue;
+                ShowChipClicked?.Invoke(rt, i);
+                _canvasDirty = true;
+                return true;
+            }
+
+            _showMenuOpen = false;
+            _canvasDirty = true;
+            return !show.IsEmpty && show.Contains(mx, my); // the button itself just closes it
         }
 
         private int GetBindButtonWidth(OverlayRenderTarget rt)
@@ -1545,15 +1801,9 @@ namespace MonoXR.Client
                 }
                 if (!show.IsEmpty && show.Contains(mx, my))
                 {
-                    var rects = GetShowChipRects(rt, show);
-                    for (int i = 0; i < rects.Count; i++)
-                    {
-                        if (!rects[i].Contains(mx, my)) continue;
-                        ShowChipClicked?.Invoke(rt, i);
-                        _canvasDirty = true;
-                        break;
-                    }
-                    return true; // the gap between chips is still part of the bar
+                    _showMenuOpen = true;
+                    _canvasDirty = true;
+                    return true;
                 }
                 if (!collapse.IsEmpty && collapse.Contains(mx, my))
                 {
@@ -1736,7 +1986,7 @@ namespace MonoXR.Client
             _canvasTarget.Dispose();
             _canvasTarget = new RenderTarget2D(GraphicsDevice, width, height);
             foreach (var rt in _targets) rt.Invalidate();
-            _canvasDirty = true;
+            ApplyPose(); // also rebuilds the triple screens at the new size
         }
 
         /// <summary>
@@ -1833,7 +2083,17 @@ namespace MonoXR.Client
             // If the layer held the shared texture this instant (publish
             // skipped), stay dirty so the next frame retries — otherwise the
             // last change would never reach VR.
-            bool published = _overlay.Update(MonoGameInterop.GetTexturePointer(_canvasTarget));
+            bool published;
+            if (_appliedTriple && _tripleOverlays != null)
+            {
+                // Each screen takes its own columns of the canvas.
+                var segs = TripleLayout();
+                IntPtr src = MonoGameInterop.GetTexturePointer(_canvasTarget);
+                published = true;
+                for (int i = 0; i < 3; i++) published &= _tripleOverlays[i].Update(src, segs[i].X0, 0);
+            }
+            else
+                published = _overlay.Update(MonoGameInterop.GetTexturePointer(_canvasTarget));
             _mgr.Heartbeat();
             if (published)
             {
@@ -1853,7 +2113,8 @@ namespace MonoXR.Client
                 if (_mgr.LayerAttached && ++_publishFailStreak >= 90)
                 {
                     _publishFailStreak = 0;
-                    RecreateOverlay();
+                    if (_appliedTriple) { DisposeTriple(); ApplyPose(); }
+                    else RecreateOverlay();
                 }
             }
         }
@@ -1966,12 +2227,16 @@ namespace MonoXR.Client
                     if (!bind.IsEmpty && BindButtonLabel != null)
                         DrawBindButton(bind, BindButtonLabel(rt).Active, GetBindButtonText(rt));
                     if (!show.IsEmpty && ShowChips != null)
-                    {
-                        var chips = ShowChips(rt);
-                        var rects = GetShowChipRects(rt, show);
-                        for (int i = 0; i < chips.Count; i++)
-                            DrawEditButton(rects[i], chips[i].Label, chips[i].On);
-                    }
+                        DrawShowButton(show, GetShowSummary(rt), _showMenuOpen);
+                }
+
+                // The open Show list goes last so it covers whatever is under it.
+                if (ShowMenuTarget is { } menuTarget)
+                {
+                    var chips = ShowChips!(menuTarget);
+                    var rects = GetShowMenuRects(menuTarget, GetEditButtons(menuTarget).Show);
+                    for (int i = 0; i < chips.Count; i++)
+                        DrawShowMenuRow(rects[i], chips[i].Label, chips[i].On);
                 }
 
                 _compositor.End();
@@ -1995,18 +2260,40 @@ namespace MonoXR.Client
         /// </summary>
         private void UpdateCursorOverlay()
         {
+            if (!_appliedTriple && Curved != _appliedCurved) ApplyPose(); // the layer has just reported what the runtime can do
             var canvas = _overlay;
             _cursorOverlay.Space = canvas.Space;
             _cursorOverlay.Rotation = canvas.Rotation;
             _cursorOverlay.CurveRadius = 0f; // always a flat marker
             _cursorOverlay.Size = new Vector2(CursorHalfLengthMeters * 2f, CursorHalfLengthMeters * 2f);
             // Hidden while calibrating (the user lines up the GAME'S cursor then).
-            _cursorOverlay.Visible = canvas.Visible && _calStep == 0;
+            _cursorOverlay.Visible = (canvas.Visible || _appliedTriple) && _calStep == 0;
+
+            if (_appliedTriple)
+            {
+                // On whichever of the three screens the cursor's column belongs to.
+                var frame = Quaternion.CreateFromYawPitchRoll(OriginYaw, OriginPitch, 0f);
+                var segs = TripleLayout();
+                float cx = _cursorX + 0.5f;
+                var seg = cx < segs[1].X0 ? segs[0] : cx < segs[2].X0 ? segs[1] : segs[2];
+                float lx = ((cx - seg.X0) / seg.Px - 0.5f) * seg.WidthM;
+                float ly = (0.5f - (_cursorY + 0.5f) / CanvasHeight) * canvas.Size.Y;
+                var turn = Quaternion.CreateFromAxisAngle(Vector3.UnitY, seg.Yaw);
+                _cursorOverlay.Rotation = frame * turn;
+                _cursorOverlay.Position = OriginPosition + Vector3.Transform(
+                    seg.Center + Vector3.Transform(new Vector3(lx, ly, 0f), turn), frame);
+
+                if (_cursorPublished)
+                    _cursorOverlay.UpdatePose();
+                else
+                    _cursorPublished = _cursorOverlay.Update(MonoGameInterop.GetTexturePointer(_cursorTexture));
+                return;
+            }
 
             // Quad-local: centered, +X right, +Y up, in meters.
             float u = (_cursorX + 0.5f) / CanvasWidth, v = (_cursorY + 0.5f) / CanvasHeight;
             var local = new Vector3((u - 0.5f) * canvas.Size.X, (0.5f - v) * canvas.Size.Y, 0f);
-            if (_curved)
+            if (_appliedCurved)
             {
                 // Follow the surface: x is arc length, so turn about the axis
                 // (which sits one radius behind the quad's centre) by that arc.
@@ -2122,6 +2409,39 @@ namespace MonoXR.Client
                 if (active || label == "+")
                     _compositor.Draw(_whitePixel, new XnaRectangle(cx - 1, cy - 8, 3, 16), XnaColor.White);
             }
+        }
+
+        /// <summary>The closed Show dropdown: its summary text and a down (open) or up arrow.</summary>
+        private void DrawShowButton(XnaRectangle r, string text, bool open)
+        {
+            DrawEditButtonFrame(r, open);
+            DrawButtonText(new XnaRectangle(r.X + EditShowChipPad / 2 + 4, r.Y, r.Width - EditShowChipPad - 30, r.Height), text, false);
+
+            // Arrow: a small triangle built from rows.
+            int cx = r.Right - 30, cy = r.Y + r.Height / 2;
+            for (int i = 0; i < 6; i++)
+            {
+                int w = open ? 2 + i * 2 : 14 - i * 2;
+                _compositor.Draw(_whitePixel, new XnaRectangle(cx - w / 2, cy - 4 + i, w, 1), XnaColor.White);
+            }
+        }
+
+        /// <summary>One row of the open Show list: a tick box and the choice's name.</summary>
+        private void DrawShowMenuRow(XnaRectangle r, string label, bool on)
+        {
+            MonoXRDraw.RoundedRect(_compositor, r, 8, new XnaColor(30, 30, 48));
+            MonoXRDraw.RoundedRectOutline(_compositor, r, 8, 2, on ? XnaColor.MediumPurple : XnaColor.Yellow);
+
+            var box = new XnaRectangle(r.X + 12, r.Y + (r.Height - 22) / 2, 22, 22);
+            _compositor.Draw(_whitePixel, box, XnaColor.White);
+            _compositor.Draw(_whitePixel, new XnaRectangle(box.X + 2, box.Y + 2, box.Width - 4, box.Height - 4),
+                             on ? new XnaColor(120, 80, 190) : new XnaColor(30, 30, 48));
+            if (on)
+            {
+                DrawLine(new XnaVector2(box.X + 5, box.Y + 12), new XnaVector2(box.X + 10, box.Y + 17), 3f, XnaColor.White);
+                DrawLine(new XnaVector2(box.X + 10, box.Y + 17), new XnaVector2(box.X + 18, box.Y + 6), 3f, XnaColor.White);
+            }
+            DrawButtonText(new XnaRectangle(box.Right + 12, r.Y, r.Width - box.Width - 36, r.Height), label, false);
         }
 
         /// <summary>The pill behind an edit-mode button; returns the fill colour, for icons that cut shapes out of it.</summary>
@@ -2318,6 +2638,7 @@ namespace MonoXR.Client
             _canvasTarget.Dispose();
             _cursorOverlay.Dispose();
             _cursorTexture.Dispose();
+            DisposeTriple();
             _overlay.Dispose();
             _mgr.Dispose();
             GraphicsDevice.Dispose();

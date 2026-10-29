@@ -185,7 +185,47 @@ public sealed unsafe class OverlayManager : IDisposable
         return false;
     }
 
+    private MonoXrHeadPose* HeadPoseBlock => (MonoXrHeadPose*)(_base + MonoXrConstants.HeadPoseOffset);
     private MonoXrEyeGaze* EyeGazeBlock => (MonoXrEyeGaze*)(_base + MonoXrConstants.EyeGazeOffset);
+    private MonoXrTrackingControl* TrackingBlock => (MonoXrTrackingControl*)(_base + MonoXrConstants.TrackingOffset);
+
+    /// <summary>
+    /// EXPERIMENTAL: ask the layer to filter the head pose the game gets from
+    /// xrLocateViews. Take effect once a game with the updated layer is running.
+    /// </summary>
+    public void SetHeadTracking(HeadTrackingSettings settings)
+    {
+        if (_base == null) return;
+        var t = TrackingBlock;
+        t->Smoothing = Math.Clamp(settings.Smoothing, 0f, 1f);
+        t->MinMovePosMm = Math.Max(0f, settings.MinMovePositionMm);
+        t->MinMoveRotDeg = Math.Max(0f, settings.MinMoveRotationDeg);
+        t->LockX = settings.LockPosition.X;
+        t->LockY = settings.LockPosition.Y;
+        t->LockZ = settings.LockPosition.Z;
+        uint flags = 0;
+        if (settings.Smooth) flags |= (uint)MonoXrTrackingFlags.Smooth;
+        if (settings.MinMove) flags |= (uint)MonoXrTrackingFlags.MinMove;
+        if (settings.LockHeadPosition) flags |= (uint)MonoXrTrackingFlags.LockPosition;
+        Volatile.Write(ref t->Flags, flags); // last: the layer reads the rest once this says it may
+    }
+
+    /// <summary>
+    /// Whether the headset runtime can draw curved overlays (it has
+    /// XR_KHR_composition_layer_cylinder): true or false once the layer has
+    /// said so, null while it has not (no OpenXR app attached yet, or the
+    /// running layer DLL predates this).
+    /// </summary>
+    public bool? CylinderLayersSupported
+    {
+        get
+        {
+            if (!LayerAttached) return null;
+            var caps = (MonoXrLayerCaps)Volatile.Read(ref HeadPoseBlock->Caps);
+            if ((caps & MonoXrLayerCaps.Known) == 0) return null;
+            return (caps & MonoXrLayerCaps.Cylinder) != 0;
+        }
+    }
 
     /// <summary>
     /// Ask the layer to poll the headset's eye tracker (true) or leave it alone
@@ -331,7 +371,11 @@ public sealed unsafe class OverlayManager : IDisposable
     {
         if (_disposed) return;
         _disposed = true;
-        if (_base != null) Volatile.Write(ref EyeGazeBlock->Request, 0u); // stop the layer polling the eyes
+        if (_base != null)
+        {
+            Volatile.Write(ref EyeGazeBlock->Request, 0u); // stop the layer polling the eyes
+            Volatile.Write(ref TrackingBlock->Flags, 0u);  // and filtering the head
+        }
         foreach (var o in _overlays) o?.Dispose();
         Array.Clear(_overlays, 0, _overlays.Length);
         if (_base != null) _view.SafeMemoryMappedViewHandle.ReleasePointer();
