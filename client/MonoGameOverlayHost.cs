@@ -284,19 +284,85 @@ namespace MonoXR.Client
             set { _tripleAngle = Math.Clamp(value, 0f, 90f); ApplyPose(); }
         }
 
-        private bool _triple, _appliedTriple;
-        private float _tripleCenter = 50f, _tripleAngle = 30f;
-        private Overlay[]? _tripleOverlays; // left, centre, right; only while Triple is on
+        /// <summary>
+        /// A fourth screen above the centre one (needs <see cref="Triple"/>): the
+        /// same width as the centre screen, <see cref="TripleTopHeight"/> tall, and
+        /// tipped forward by <see cref="TripleTopAngle"/>. Its picture is an extra
+        /// band along the top of the canvas, so it is reached by moving the cursor
+        /// up past the other screens; panels already on the canvas move down with
+        /// the rest (see <see cref="CanvasExtraHeightMeters"/>).
+        /// </summary>
+        public bool TripleTop
+        {
+            get => _tripleTop;
+            set { _tripleTop = value; ApplyPose(); }
+        }
+
+        /// <summary>Height of the top screen in meters.</summary>
+        public float TripleTopHeight
+        {
+            get => _tripleTopHeight;
+            set { _tripleTopHeight = Math.Clamp(value, 0.2f, 4f); ApplyPose(); }
+        }
+
+        /// <summary>How far the top screen tips forward, in degrees: 0 is upright, 90 faces straight down.</summary>
+        public float TripleTopAngle
+        {
+            get => _tripleTopAngle;
+            set { _tripleTopAngle = Math.Clamp(value, 0f, 90f); ApplyPose(); }
+        }
+
+        /// <summary>
+        /// Meters of canvas the top screen adds above the normal area: its height
+        /// while it is on, otherwise 0. The caller sizes the canvas as
+        /// (<see cref="DisplaySize"/>.Y + this) x pixels per meter.
+        /// </summary>
+        public float CanvasExtraHeightMeters => _triple && _tripleTop ? _tripleTopHeight : 0f;
+
+        private bool _triple, _appliedTriple, _tripleTop;
+        private float _tripleCenter = 50f, _tripleAngle = 30f, _tripleTopHeight = 1f, _tripleTopAngle = 30f;
+        private Overlay[]? _tripleOverlays; // left, centre, right (and top); only while Triple is on
 
         // One screen of the triple layout: the canvas columns it shows, its
         // width in meters, and where it sits in the view origin's frame (a yaw
         // about its own up axis; positive turns it toward +X).
-        private readonly record struct TripleSegment(int X0, int Px, float WidthM, float Yaw, Vector3 Center);
+        // The canvas rectangle it shows (X0, Y0, Px, Py), its size in meters, and
+        // its turn: Yaw about its own up axis (positive toward +X), Pitch about
+        // its own right axis (positive tips the top toward the viewer).
+        private readonly record struct TripleSegment(int X0, int Y0, int Px, int Py,
+                                                     float WidthM, float HeightM, float Yaw, float Pitch, Vector3 Center);
 
+        private static Quaternion SegmentRotation(TripleSegment s) =>
+            Quaternion.CreateFromAxisAngle(Vector3.UnitY, s.Yaw) * Quaternion.CreateFromAxisAngle(Vector3.UnitX, s.Pitch);
+
+        // Height in canvas pixels of the band along the top of the canvas that the
+        // top screen shows (0 without one): its share of the canvas height.
+        private int BandPx()
+        {
+            float extraM = CanvasExtraHeightMeters;
+            if (extraM <= 0f) return 0;
+            int h = CanvasHeight;
+            float mainM = _overlay.Size.Y;
+            int mainPx = Math.Clamp((int)MathF.Round(h * mainM / (mainM + extraM)), 1, Math.Max(1, h - 1));
+            return h - mainPx;
+        }
+
+        // The band height the panels were last arranged around; they are moved
+        // by the difference when the canvas is rebuilt with a different band.
+        private int _bandPxApplied;
+
+        // Left, centre, right, then the top screen when there is one.
         private TripleSegment[] TripleLayout()
         {
             Vector2 size = _overlay.Size;
-            int w = CanvasWidth;
+            int w = CanvasWidth, h = CanvasHeight;
+
+            // The top screen's band runs along the top of the canvas; the other
+            // three screens show what is below it.
+            float extraM = CanvasExtraHeightMeters;
+            int topPx = BandPx();
+            int mainPx = h - topPx;
+
             int centerPx = Math.Clamp((int)MathF.Round(w * _tripleCenter / 100f), 1, Math.Max(1, w - 2));
             int leftPx = (w - centerPx) / 2, rightPx = w - centerPx - leftPx;
 
@@ -307,30 +373,40 @@ namespace MonoXR.Client
 
             // The centre faces straight ahead. Each outer screen hinges on a
             // centre edge and swings toward the viewer (+Z) by the angle.
-            return new[]
+            var segs = new List<TripleSegment>(4)
             {
-                new TripleSegment(0, leftPx, lm, angle,
+                new TripleSegment(0, topPx, leftPx, mainPx, lm, size.Y, angle, 0f,
                     new Vector3(_offsetX - cm / 2f - lm / 2f * cos, _offsetY, z + lm / 2f * sin)),
-                new TripleSegment(leftPx, centerPx, cm, 0f, new Vector3(_offsetX, _offsetY, z)),
-                new TripleSegment(leftPx + centerPx, rightPx, rm, -angle,
+                new TripleSegment(leftPx, topPx, centerPx, mainPx, cm, size.Y, 0f, 0f, new Vector3(_offsetX, _offsetY, z)),
+                new TripleSegment(leftPx + centerPx, topPx, rightPx, mainPx, rm, size.Y, -angle, 0f,
                     new Vector3(_offsetX + cm / 2f + rm / 2f * cos, _offsetY, z + rm / 2f * sin)),
             };
+
+            // The top screen hinges on the centre screen's top edge and tips
+            // forward (its top toward the viewer, so its face looks down).
+            if (extraM > 0f && topPx >= 1)
+            {
+                float pitch = _tripleTopAngle * MathF.PI / 180f;
+                var hinge = new Vector3(_offsetX, _offsetY + size.Y / 2f, z);
+                segs.Add(new TripleSegment(leftPx, 0, centerPx, topPx, cm, extraM, 0f, pitch,
+                    hinge + new Vector3(0f, extraM / 2f * MathF.Cos(pitch), extraM / 2f * MathF.Sin(pitch))));
+            }
+            return segs.ToArray();
         }
 
         // Make sure the three overlays exist and match the layout's pixel slices.
         private void EnsureTriple(TripleSegment[] segs)
         {
-            int h = CanvasHeight;
             if (_tripleOverlays != null)
             {
-                bool same = true;
-                for (int i = 0; i < 3; i++)
-                    same &= _tripleOverlays[i].Width == segs[i].Px && _tripleOverlays[i].Height == h;
+                bool same = _tripleOverlays.Length == segs.Length;
+                for (int i = 0; same && i < segs.Length; i++)
+                    same &= _tripleOverlays[i].Width == segs[i].Px && _tripleOverlays[i].Height == segs[i].Py;
                 if (same) return;
                 DisposeTriple();
             }
-            _tripleOverlays = new Overlay[3];
-            for (int i = 0; i < 3; i++) _tripleOverlays[i] = _mgr.CreateOverlay(segs[i].Px, h);
+            _tripleOverlays = new Overlay[segs.Length];
+            for (int i = 0; i < segs.Length; i++) _tripleOverlays[i] = _mgr.CreateOverlay(segs[i].Px, segs[i].Py);
         }
 
         private void DisposeTriple()
@@ -404,13 +480,13 @@ namespace MonoXR.Client
                 _appliedCurved = false;
                 var segs = TripleLayout();
                 EnsureTriple(segs);
-                for (int i = 0; i < 3; i++)
+                for (int i = 0; i < segs.Length; i++)
                 {
                     var o = _tripleOverlays![i];
                     o.Space = _overlay.Space;
-                    o.Rotation = rotation * Quaternion.CreateFromAxisAngle(Vector3.UnitY, segs[i].Yaw);
+                    o.Rotation = rotation * SegmentRotation(segs[i]);
                     o.Position = OriginPosition + Vector3.Transform(segs[i].Center, rotation);
-                    o.Size = new Vector2(segs[i].WidthM, _overlay.Size.Y);
+                    o.Size = new Vector2(segs[i].WidthM, segs[i].HeightM);
                     o.CurveRadius = 0f;
                     o.ZOrder = _overlay.ZOrder;
                     o.Visible = true;
@@ -569,34 +645,34 @@ namespace MonoXR.Client
             var segs = TripleLayout();
             float bestT = float.MaxValue;
             bool found = false;
-            for (int i = 0; i < 3; i++)
+            for (int i = 0; i < segs.Length; i++)
             {
-                if (!TryHitScreen(segs[i], eye, look, frame, size, out float t, out float lx, out float ly)) continue;
-                bool inside = MathF.Abs(lx) <= segs[i].WidthM / 2f && MathF.Abs(ly) <= size.Y / 2f;
+                if (!TryHitScreen(segs[i], eye, look, frame, out float t, out float lx, out float ly)) continue;
+                bool inside = MathF.Abs(lx) <= segs[i].WidthM / 2f && MathF.Abs(ly) <= segs[i].HeightM / 2f;
                 if (inside && t < bestT)
                 {
                     bestT = t;
                     found = true;
                     x = segs[i].X0 + (lx / segs[i].WidthM + 0.5f) * segs[i].Px;
-                    y = (0.5f - ly / size.Y) * CanvasHeight;
+                    y = segs[i].Y0 + (0.5f - ly / segs[i].HeightM) * segs[i].Py;
                 }
             }
             if (!found)
             {
-                if (!TryHitScreen(segs[1], eye, look, frame, size, out _, out float lx, out float ly)) return false;
+                if (!TryHitScreen(segs[1], eye, look, frame, out _, out float lx, out float ly)) return false;
                 x = segs[1].X0 + (lx / segs[1].WidthM + 0.5f) * segs[1].Px;
-                y = (0.5f - ly / size.Y) * CanvasHeight;
+                y = segs[1].Y0 + (0.5f - ly / segs[1].HeightM) * segs[1].Py;
             }
             return float.IsFinite(x) && float.IsFinite(y);
         }
 
         // Ray/plane intersection with one screen: distance along the ray and the
         // hit in the screen's own right/up axes, relative to its centre.
-        private bool TryHitScreen(TripleSegment seg, Vector3 eye, Vector3 look, Quaternion frame, Vector2 size,
+        private bool TryHitScreen(TripleSegment seg, Vector3 eye, Vector3 look, Quaternion frame,
                                   out float t, out float lx, out float ly)
         {
             t = lx = ly = 0f;
-            Quaternion rot = frame * Quaternion.CreateFromAxisAngle(Vector3.UnitY, seg.Yaw);
+            Quaternion rot = frame * SegmentRotation(seg);
             Vector3 center = OriginPosition + Vector3.Transform(seg.Center, frame);
             Vector3 right = Vector3.Transform(Vector3.UnitX, rot);
             Vector3 up = Vector3.Transform(Vector3.UnitY, rot);
@@ -688,7 +764,7 @@ namespace MonoXR.Client
                 if (_editMode == value) return;
                 _editMode = value;
                 _canvasDirty = true;
-                if (!value) { _selected = null; _group.Clear(); _marquee = false; _groupDrag = false; _showMenuOpen = false; }
+                if (!value) { _selected = null; _group.Clear(); _marquee = false; _groupDrag = false; _showMenuOpen = false; CloseDocks(); }
                 EditModeChanged?.Invoke(value);
                 // Let targets react (e.g. draw a placeholder while edited).
                 foreach (var rt in _targets)
@@ -1259,6 +1335,11 @@ namespace MonoXR.Client
                     _lmbWasDown = lmb;
                     return;
                 }
+                if (HandleDockPress(mx, my))
+                {
+                    _lmbWasDown = lmb;
+                    return;
+                }
                 if (!HandleHiddenShowClick(mx, my) && !HandleEditButtonClick(mx, my))
                 {
                     // A hidden target's pill is drawn above every panel, so it
@@ -1679,6 +1760,105 @@ namespace MonoXR.Client
             return label.StartsWith(lead, StringComparison.OrdinalIgnoreCase) ? label.Substring(lead.Length).Trim() : label;
         }
 
+        // ----- Docked panels ---------------------------------------------------
+        // A docked target (see OverlayRenderTarget.DockSide) sits against the
+        // left or right canvas edge, vertically centred, behind a small arrow
+        // tab that opens and closes it. The host places and sizes it; it is never
+        // selected, dragged, or given the button bar.
+        private const int DockTabWidth = 56;
+        private const int DockTabHeight = 180;
+        private const int DockMargin = 16;   // clear space kept around an open panel
+
+        private void LayoutDocks()
+        {
+            foreach (var rt in _targets)
+            {
+                if (!rt.IsDocked) continue;
+                if (rt.State != OverlayTargetState.Visible) rt.State = OverlayTargetState.Visible;
+
+                // Shrink a panel that is too big for the canvas so it always fits.
+                float fit = MathF.Min(1f, MathF.Min((CanvasHeight - DockMargin) / (float)rt.Height,
+                                                    (CanvasWidth - DockTabWidth - DockMargin) / (float)rt.Width));
+                rt.Scale = Math.Max(OverlayRenderTarget.MinScale, fit);
+
+                int w = rt.DisplayWidth, h = rt.DisplayHeight;
+                rt.X = rt.DockSide == OverlayDockSide.Right ? Math.Max(0, CanvasWidth - w) : 0;
+                rt.Y = Math.Max(0, (CanvasHeight - h) / 2);
+            }
+        }
+
+        private void CloseDocks()
+        {
+            foreach (var rt in _targets)
+                if (rt.IsDocked && rt.DockOpen) { rt.DockOpen = false; _canvasDirty = true; }
+        }
+
+        // Targets that are docked and exist right now in edit mode (open or not).
+        private IEnumerable<OverlayRenderTarget> EditDocks()
+        {
+            if (!EditMode) yield break;
+            foreach (var rt in _targets)
+                if (rt.IsDocked && !rt.EditHidden) yield return rt;
+        }
+
+        private XnaRectangle GetDockTab(OverlayRenderTarget rt)
+        {
+            int h = Math.Min(DockTabHeight, CanvasHeight);
+            int y = (CanvasHeight - h) / 2;
+            int panel = rt.DockOpen ? rt.DisplayWidth : 0;
+            int x = rt.DockSide == OverlayDockSide.Right ? CanvasWidth - panel - DockTabWidth : panel;
+            return new XnaRectangle(x, y, DockTabWidth, h);
+        }
+
+        /// <summary>A press on a dock tab toggles its panel; a press inside an open docked panel goes to it. True when used.</summary>
+        private bool HandleDockPress(int mx, int my)
+        {
+            foreach (var rt in EditDocks())
+            {
+                if (GetDockTab(rt).Contains(mx, my))
+                {
+                    rt.DockOpen = !rt.DockOpen;
+                    if (rt.DockOpen) BringToFront(rt);
+                    _selected = null;
+                    _canvasDirty = true;
+                    return true;
+                }
+            }
+            foreach (var rt in EditDocks())
+            {
+                if (!rt.DockOpen) continue;
+                if (mx < rt.X || mx >= rt.X + rt.DisplayWidth || my < rt.Y || my >= rt.Y + rt.DisplayHeight) continue;
+                if (rt.OnEditPress(ToLocalX(rt, mx), ToLocalY(rt, my)))
+                {
+                    _editCapture = rt;
+                    _canvasDirty = true;
+                }
+                return true; // the panel is in the way either way
+            }
+            return false;
+        }
+
+        /// <summary>A dock tab: a rounded handle on the canvas edge with an arrow that points in to open and out to close.</summary>
+        private void DrawDockTab(OverlayRenderTarget rt)
+        {
+            var r = GetDockTab(rt);
+            var bg = rt.DockOpen ? new XnaColor(90, 60, 140) : new XnaColor(40, 40, 60);
+            var edge = rt.DockOpen ? XnaColor.MediumPurple : XnaColor.Yellow;
+            MonoXRDraw.RoundedRect(_compositor, r, 14, bg);
+            MonoXRDraw.RoundedRectOutline(_compositor, r, 14, 2, edge);
+
+            // Arrow toward the canvas centre when closed (pull the panel out), away from it when open.
+            bool right = rt.DockSide == OverlayDockSide.Right;
+            bool pointsLeft = right != rt.DockOpen;
+            int cx = r.X + r.Width / 2, cy = r.Y + r.Height / 2;
+            for (int k = 0; k < 12; k++)
+            {
+                int x = pointsLeft ? cx - 8 + k : cx + 8 - k;
+                int barH = 2 + k * 2;
+                _compositor.Draw(_whitePixel, new XnaRectangle(x, cy - barH / 2, 1, barH), XnaColor.White);
+            }
+        }
+
         // The Show setting is one dropdown button on the bar ("Show: Practice, Race")
         // that opens a list with a row per choice (All, then each session type).
         // Rows toggle on click and the list stays open, so several can be ticked;
@@ -1986,6 +2166,19 @@ namespace MonoXR.Client
             _canvasTarget.Dispose();
             _canvasTarget = new RenderTarget2D(GraphicsDevice, width, height);
             foreach (var rt in _targets) rt.Invalidate();
+
+            // The top screen's band sits above everything, so when it appears,
+            // grows or goes, the panels move with the rest of the canvas.
+            int band = BandPx();
+            if (band != _bandPxApplied)
+            {
+                foreach (var rt in _targets)
+                {
+                    rt.Y += band - _bandPxApplied;
+                    ClampToCanvas(rt);
+                }
+                _bandPxApplied = band;
+            }
             ApplyPose(); // also rebuilds the triple screens at the new size
         }
 
@@ -1999,6 +2192,8 @@ namespace MonoXR.Client
             if (_disposed) return;
 
             var total = TimeSpan.FromSeconds(totalSeconds);
+
+            LayoutDocks();
 
             // Sample the mouse and apply edit-mode dragging on EVERY call,
             // before the frame-rate cap — so callers can tick faster than
@@ -2090,7 +2285,8 @@ namespace MonoXR.Client
                 var segs = TripleLayout();
                 IntPtr src = MonoGameInterop.GetTexturePointer(_canvasTarget);
                 published = true;
-                for (int i = 0; i < 3; i++) published &= _tripleOverlays[i].Update(src, segs[i].X0, 0);
+                for (int i = 0; i < _tripleOverlays.Length && i < segs.Length; i++)
+                    published &= _tripleOverlays[i].Update(src, segs[i].X0, segs[i].Y0);
             }
             else
                 published = _overlay.Update(MonoGameInterop.GetTexturePointer(_canvasTarget));
@@ -2176,7 +2372,7 @@ namespace MonoXR.Client
                     src, XnaColor.White * rt.Opacity);
                 _compositor.End();
 
-                if (EditMode) DrawEditOutline(rt);
+                if (EditMode && !rt.IsDocked) DrawEditOutline(rt);
             }
             if (EditMode)
             {
@@ -2190,6 +2386,18 @@ namespace MonoXR.Client
                 _compositor.Draw(_whitePixel, new XnaRectangle(0, h - t, w, t), XnaColor.Red);
                 _compositor.Draw(_whitePixel, new XnaRectangle(0, t, t, h - 2 * t), XnaColor.Red);
                 _compositor.Draw(_whitePixel, new XnaRectangle(w - t, t, t, h - 2 * t), XnaColor.Red);
+
+                // With a top screen, only the middle columns of the band along the
+                // top of the canvas are shown in VR: dim the rest, and mark where
+                // the band ends.
+                if (_appliedTriple && _tripleOverlays is { Length: 4 })
+                {
+                    var top = TripleLayout()[3];
+                    var dim = XnaColor.Black * 0.6f;
+                    _compositor.Draw(_whitePixel, new XnaRectangle(0, 0, top.X0, top.Py), dim);
+                    _compositor.Draw(_whitePixel, new XnaRectangle(top.X0 + top.Px, 0, w - top.X0 - top.Px, top.Py), dim);
+                    _compositor.Draw(_whitePixel, new XnaRectangle(0, top.Py - 1, w, 2), XnaColor.Yellow * 0.8f);
+                }
 
                 // Hidden targets: just their name and a Show button.
                 foreach (var rt in _targets)
@@ -2229,6 +2437,8 @@ namespace MonoXR.Client
                     if (!show.IsEmpty && ShowChips != null)
                         DrawShowButton(show, GetShowSummary(rt), _showMenuOpen);
                 }
+
+                foreach (var dockRt in EditDocks()) DrawDockTab(dockRt);
 
                 // The open Show list goes last so it covers whatever is under it.
                 if (ShowMenuTarget is { } menuTarget)
@@ -2274,11 +2484,12 @@ namespace MonoXR.Client
                 // On whichever of the three screens the cursor's column belongs to.
                 var frame = Quaternion.CreateFromYawPitchRoll(OriginYaw, OriginPitch, 0f);
                 var segs = TripleLayout();
-                float cx = _cursorX + 0.5f;
-                var seg = cx < segs[1].X0 ? segs[0] : cx < segs[2].X0 ? segs[1] : segs[2];
+                float cx = _cursorX + 0.5f, cy = _cursorY + 0.5f;
+                var seg = segs.Length == 4 && cy < segs[3].Py ? segs[3] // the extra band along the top: the top screen
+                        : cx < segs[1].X0 ? segs[0] : cx < segs[2].X0 ? segs[1] : segs[2];
                 float lx = ((cx - seg.X0) / seg.Px - 0.5f) * seg.WidthM;
-                float ly = (0.5f - (_cursorY + 0.5f) / CanvasHeight) * canvas.Size.Y;
-                var turn = Quaternion.CreateFromAxisAngle(Vector3.UnitY, seg.Yaw);
+                float ly = (0.5f - (cy - seg.Y0) / seg.Py) * seg.HeightM;
+                var turn = SegmentRotation(seg);
                 _cursorOverlay.Rotation = frame * turn;
                 _cursorOverlay.Position = OriginPosition + Vector3.Transform(
                     seg.Center + Vector3.Transform(new Vector3(lx, ly, 0f), turn), frame);

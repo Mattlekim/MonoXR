@@ -19,6 +19,15 @@ namespace MonoXR.Client
         Collapsed,
     }
 
+    /// <summary>Which canvas edge an <see cref="OverlayRenderTarget"/> is docked to.</summary>
+    public enum OverlayDockSide
+    {
+        /// <summary>Free-standing: placed and dragged anywhere.</summary>
+        None,
+        Left,
+        Right,
+    }
+
     /// <summary>
     /// One MonoGame render target placed somewhere on the overlay canvas.
     /// Inherit from this and override <see cref="Update"/> (game logic) and
@@ -101,7 +110,32 @@ namespace MonoXR.Client
         /// True when this target takes no part right now: outside edit mode when
         /// not <see cref="IsLive"/>, inside it when <see cref="EditHidden"/>.
         /// </summary>
-        public bool IsSkipped(bool editMode) => editMode ? _editHidden : !IsLive;
+        public bool IsSkipped(bool editMode) => (IsDocked && !_dockOpen) || (editMode ? _editHidden : !IsLive);
+
+        private OverlayDockSide _dockSide;
+        private bool _dockOpen;
+
+        /// <summary>
+        /// Docks the target to a canvas edge, vertically centred: the host then
+        /// owns its position and size (no dragging, no edit button bar), shows
+        /// only a small arrow tab while it is closed, and the panel itself once
+        /// the tab has been clicked (<see cref="DockOpen"/>). Meant for panels
+        /// that only exist in edit mode (<see cref="EditModeOnly"/>).
+        /// </summary>
+        public OverlayDockSide DockSide
+        {
+            get => _dockSide;
+            set { if (_dockSide != value) { _dockSide = value; Invalidate(); } }
+        }
+
+        /// <summary>Whether a docked target is expanded. Closed (the start state) it takes no part but for its tab.</summary>
+        public bool DockOpen
+        {
+            get => _dockOpen;
+            set { if (_dockOpen != value) { _dockOpen = value; Invalidate(); } }
+        }
+
+        public bool IsDocked => _dockSide != OverlayDockSide.None;
 
         /// <summary>Hidden / Visible / Collapsed. Changing it re-renders and republishes.</summary>
         public OverlayTargetState State
