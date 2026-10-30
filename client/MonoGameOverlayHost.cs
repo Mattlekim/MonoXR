@@ -444,12 +444,13 @@ namespace MonoXR.Client
         }
 
         /// <summary>
-        /// Recenter the overlay on where the headset is looking right now: its
-        /// center moves to <see cref="Distance"/> along the headset's current
-        /// line of sight (up/down as well as left/right) and it turns to face
-        /// the user. Head roll is ignored, so the overlay stays level however
-        /// the head is tilted. Returns false when no pose is available (no
-        /// OpenXR app running, or the game still has an older layer DLL loaded).
+        /// Recenter the overlay on the headset: it moves to the head's position
+        /// and turns to the direction the head faces left/right, at
+        /// <see cref="Distance"/> straight ahead. Up/down head rotation (pitch)
+        /// and head roll are ignored, so the overlay stays at eye level and
+        /// level however the head is tilted. Returns false when no pose is
+        /// available (no OpenXR app running, or the game still has an older
+        /// layer DLL loaded).
         /// </summary>
         public bool Recenter()
         {
@@ -457,7 +458,7 @@ namespace MonoXR.Client
                 return false;
 
             Vector3 forward = Vector3.Normalize(Vector3.Transform(-Vector3.UnitZ, rotation));
-            float pitch = MathF.Asin(Math.Clamp(forward.Y, -1f, 1f));
+            const float pitch = 0f;
 
             // Heading from the horizontal part of the look direction; keep the
             // old one if the user is looking straight up/down (no heading).
