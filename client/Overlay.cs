@@ -37,6 +37,12 @@ public sealed unsafe class Overlay : IDisposable
     public Vector2 Size = new(1.0f, 0.6f);
     public MonoXrSpace Space = MonoXrSpace.World;
     public bool Visible = true;
+
+    /// <summary>
+    /// Which eye sees this overlay. Two overlays at the same pose, one Left and one
+    /// Right, with their own pictures, make a stereo window.
+    /// </summary>
+    public MonoXrEye Eye = MonoXrEye.Both;
     public int ZOrder;
 
     /// <summary>
@@ -199,7 +205,7 @@ public sealed unsafe class Overlay : IDisposable
 
     private void WriteMetadata(MonoXrOverlaySlot* slot)
     {
-        slot->Visible = Visible ? 1u : 0u;
+        slot->Visible = (Visible ? 1u : 0u) | ((uint)Eye << 1);
         slot->Space = (uint)Space;
         slot->ZOrder = ZOrder;
         slot->CurveRadius = CurveRadius;

@@ -48,22 +48,25 @@ public sealed class BenchmarkSeries
 public sealed class BenchmarkPhase
 {
     public string Name { get; }
+    public string Key { get; }
     public bool PerWindow { get; }
+    public bool Stereo { get; }
     public double Seconds { get; internal set; }
     public int Frames { get; internal set; }
     public Dictionary<string, BenchmarkSeries> Series { get; } = new();
 
-    internal BenchmarkPhase(string name, bool perWindow)
+    internal BenchmarkPhase(string name, string key, bool perWindow, bool stereo)
     {
-        Name = name; PerWindow = perWindow;
+        Name = name; Key = key; PerWindow = perWindow; Stereo = stereo;
         foreach (var m in OverlayBenchmark.Metrics)
             Series[m.Key] = new BenchmarkSeries(m.Label, m.Unit, m.LowerIsBetter);
     }
 }
 
 /// <summary>
-/// Measures what one overlay per window costs against the single canvas.
-/// Runs the overlay in each mode for <see cref="PhaseDuration"/> (the first
+/// Measures what one overlay per window, and then the 3D option (an overlay per eye),
+/// cost against the single canvas.
+/// Runs the overlay in each of the three modes for <see cref="PhaseDuration"/> (the first
 /// <see cref="Warmup"/> of each is thrown away, the layer and the GPU need a
 /// moment to settle after a switch), samples GPU load and GPU memory once a
 /// second, then writes a comparison.
@@ -99,7 +102,10 @@ public sealed class OverlayBenchmark : IDisposable
     private readonly MonoGameOverlayHost _host;
     private readonly Stopwatch _phaseClock = new();
     private readonly Stopwatch _frameClock = new();
-    private readonly BenchmarkPhase?[] _phases = new BenchmarkPhase?[2];
+    private const int PhaseCount = 3;
+    private readonly BenchmarkPhase?[] _phases = new BenchmarkPhase?[PhaseCount];
+    private bool _originalStereo;
+    private float _originalStereoDepth;
     private GpuCounterReader? _gpu;
     private int _phase;
     private TimeSpan _lastSample;
@@ -109,7 +115,7 @@ public sealed class OverlayBenchmark : IDisposable
     private bool _gameSeen;
     private int _gamePid;
 
-    /// <summary>How long each of the two modes is measured for (default 2 minutes).</summary>
+    /// <summary>How long each of the three modes is measured for (default 2 minutes).</summary>
     public TimeSpan PhaseDuration { get; set; } = TimeSpan.FromMinutes(2);
 
     /// <summary>Time at the start of each phase that is run but not measured.</summary>
@@ -134,7 +140,7 @@ public sealed class OverlayBenchmark : IDisposable
     /// <summary>One line on what it is doing, with the time left.</summary>
     public string Status { get; private set; } = "";
 
-    /// <summary>0 to 1 over both phases.</summary>
+    /// <summary>0 to 1 over all the phases.</summary>
     public double Progress { get; private set; }
 
     /// <summary>The comparison, once <see cref="State"/> is Finished.</summary>
@@ -170,7 +176,9 @@ public sealed class OverlayBenchmark : IDisposable
         if (error.Length > 0) return false;
 
         _originalPerWindow = _host.PerWindowOverlays;
-        _phases[0] = _phases[1] = null;
+        _originalStereo = _host.Stereo3D;
+        _originalStereoDepth = _host.StereoDepth;
+        Array.Clear(_phases);
         _gameSeen = false;
         _gamePid = 0;
         Report = ReportPath = Error = null;
@@ -231,6 +239,11 @@ public sealed class OverlayBenchmark : IDisposable
                     : "Stopped: the overlay did not stay in single-canvas mode.");
                 return;
             }
+            if (elapsed > TimeSpan.FromSeconds(3) && phase.Stereo && _host.StereoWindowCount == 0)
+            {
+                End(BenchmarkState.Failed, "Stopped: no window was shown as an overlay per eye (no overlay slots left for the second eye?).");
+                return;
+            }
 
             _gamePid = _host.LayerAttached ? (int)_host.LayerProcessId : 0;
             if (_gamePid != 0) _gameSeen = true;
@@ -239,11 +252,11 @@ public sealed class OverlayBenchmark : IDisposable
             if (measuring) TakeSample(phase, dt);
             else _lastPixels = _host.PublishedPixels;
 
-            double total = (_phases.Length * PhaseDuration.TotalSeconds);
+            double total = PhaseCount * PhaseDuration.TotalSeconds;
             double done = _phase * PhaseDuration.TotalSeconds + Math.Min(elapsed.TotalSeconds, PhaseDuration.TotalSeconds);
             Progress = Math.Clamp(done / total, 0, 1);
             var left = PhaseDuration - elapsed;
-            Status = $"Phase {_phase + 1} of 2: {phase.Name}" + (measuring ? "" : " (warming up)") +
+            Status = $"Phase {_phase + 1} of {PhaseCount}: {phase.Name}" + (measuring ? "" : " (warming up)") +
                      $" - {Math.Max(0, (int)left.TotalSeconds)} s left";
         }
 
@@ -252,22 +265,30 @@ public sealed class OverlayBenchmark : IDisposable
 
     private void BeginPhase()
     {
-        bool perWindow = _phase == 1;
-        _phases[_phase] = new BenchmarkPhase(perWindow ? "One overlay per window" : "Single canvas", perWindow);
-        _host.PerWindowOverlays = perWindow;
+        _phases[_phase] = _phase switch
+        {
+            0 => new BenchmarkPhase("Single canvas", "canvas", false, false),
+            1 => new BenchmarkPhase("One overlay per window", "per-window", true, false),
+            _ => new BenchmarkPhase("Per window + 3D (overlay per eye)", "per-window-3d", true, true),
+        };
+        var phase = _phases[_phase]!;
+        _host.PerWindowOverlays = phase.PerWindow;
+        _host.Stereo3D = phase.Stereo;
+        // A window only gets a pair of overlays when it has some depth to show.
+        if (phase.Stereo && MathF.Abs(_originalStereoDepth) < 0.01f) _host.StereoDepth = 0.2f;
         _phaseClock.Restart();
         _lastSample = TimeSpan.Zero;
         _lastPixels = _host.PublishedPixels;
-        Status = $"Phase {_phase + 1} of 2: {_phases[_phase]!.Name} (warming up)";
+        Status = $"Phase {_phase + 1} of {PhaseCount}: {phase.Name} (warming up)";
     }
 
     private void EndPhase()
     {
         var phase = _phases[_phase]!;
         phase.Seconds = Math.Max(0, (_phaseClock.Elapsed - Warmup).TotalSeconds);
-        if (_phase == 0)
+        if (_phase < PhaseCount - 1)
         {
-            _phase = 1;
+            _phase++;
             BeginPhase();
             return;
         }
@@ -280,6 +301,8 @@ public sealed class OverlayBenchmark : IDisposable
     private void End(BenchmarkState state, string message)
     {
         _host.PerWindowOverlays = _originalPerWindow;
+        _host.Stereo3D = _originalStereo;
+        _host.StereoDepth = _originalStereoDepth;
         _gpu?.Dispose();
         _gpu = null;
         State = state;
@@ -334,76 +357,83 @@ public sealed class OverlayBenchmark : IDisposable
 
     private string BuildReport()
     {
-        var a = _phases[0]!;
-        var b = _phases[1]!;
-        var inv = CultureInfo.InvariantCulture;
+        var a = _phases[0]!;   // single canvas
+        var b = _phases[1]!;   // one overlay per window
+        var c = _phases[2]!;   // ... and 3D
         var sb = new StringBuilder();
 
-        sb.AppendLine("OVERLAY BENCHMARK: single canvas vs one overlay per window");
-        sb.AppendLine(new string('=', 78));
+        sb.AppendLine("OVERLAY BENCHMARK: single canvas vs one overlay per window vs per window + 3D");
+        sb.AppendLine(new string('=', 100));
         sb.AppendLine($"Date:       {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
         sb.AppendLine($"Windows:    {_host.RenderTargets.Count(rt => rt.Visible && !rt.IsSkipped(false))} visible, canvas {_host.CanvasWidth} x {_host.CanvasHeight} px");
         sb.AppendLine($"Each mode:  {PhaseDuration.TotalSeconds:0} s (first {Warmup.TotalSeconds:0} s not counted)");
         sb.AppendLine("Workload:   one window is refreshed every tick, in turn");
+        sb.AppendLine($"3D:         every window {_host.StereoDepth.ToString("0.##", CultureInfo.InvariantCulture)} m out of its frame, {c.Series["overlays"].Average:0} overlays in total");
         sb.AppendLine(_gameSeen
             ? "VR game:    attached, its GPU numbers are included"
             : "VR game:    NOT attached. Only this app's cost was measured; start the VR game with the layer for the game's GPU numbers.");
         sb.AppendLine();
 
         // The headline: the rows people look at first.
-        sb.AppendLine("SUMMARY");
-        sb.AppendLine(new string('-', 78));
-        var lines = new List<string>();
-        foreach (var key in new[] { "gameMem", "appMem", "totalMem", "gameGpu", "appGpu", "totalGpu", "frame", "mpix" })
-            if (Describe(a, b, key) is { } line) lines.Add(line);
-        if (lines.Count == 0) lines.Add("No GPU counters could be read, so only frame time and copy volume are compared below.");
-        foreach (var l in lines) sb.AppendLine(l);
-        sb.AppendLine();
+        string[] headline = { "gameMem", "appMem", "totalMem", "gameGpu", "appGpu", "totalGpu", "frame", "mpix" };
+        AppendSummary(sb, "ONE OVERLAY PER WINDOW vs SINGLE CANVAS", a, b, headline);
+        AppendSummary(sb, "3D (AN OVERLAY PER EYE) vs ONE OVERLAY PER WINDOW: what 3D adds", b, c, headline);
 
         sb.AppendLine("DETAILS (averages over the measured time)");
-        sb.AppendLine(new string('-', 78));
-        sb.AppendLine($"{"",-42}{"Canvas",10}{"Per-window",12}{"Change",18}");
+        sb.AppendLine(new string('-', 100));
+        sb.AppendLine($"{"",-40}{"Canvas",10}{"Per-window",12}{"Per-win+3D",12}{"Per-win vs canvas",20}{"3D vs per-win",18}");
         foreach (var m in Metrics)
         {
             var sa = a.Series[m.Key];
             var sb2 = b.Series[m.Key];
-            string unit = m.Unit.Length > 0 ? " " + m.Unit : "";
-            if (!sa.HasData && !sb2.HasData)
+            var sc = c.Series[m.Key];
+            if (!sa.HasData && !sb2.HasData && !sc.HasData)
             {
-                sb.AppendLine($"{m.Label,-42}{"n/a",10}{"n/a",12}");
+                sb.AppendLine($"{m.Label,-40}{"n/a",10}{"n/a",12}{"n/a",12}");
                 continue;
             }
-            double va = sa.Average, vb = sb2.Average;
-            sb.AppendLine($"{m.Label,-42}{Fmt(va),10}{Fmt(vb),12}{Change(va, vb),18}  {m.Unit}");
+            double va = sa.Average, vb = sb2.Average, vc = sc.Average;
+            sb.AppendLine($"{m.Label,-40}{Fmt(va),10}{Fmt(vb),12}{Fmt(vc),12}{Change(va, vb),20}{Change(vb, vc),18}  {m.Unit}");
         }
         sb.AppendLine();
         sb.AppendLine("Frame time spread (ms)        average     95th %        worst");
-        foreach (var p in new[] { a, b })
+        foreach (var p in new[] { a, b, c })
         {
             var f = p.Series["frame"];
-            sb.AppendLine($"  {p.Name,-28}{Fmt(f.Average),9}{Fmt(f.P95),11}{Fmt(f.Max),13}   ({p.Frames} frames)");
+            sb.AppendLine($"  {p.Name,-34}{Fmt(f.Average),9}{Fmt(f.P95),11}{Fmt(f.Max),13}   ({p.Frames} frames)");
         }
         sb.AppendLine();
         sb.AppendLine("PEAKS");
-        sb.AppendLine(new string('-', 78));
+        sb.AppendLine(new string('-', 100));
         foreach (var key in new[] { "appGpu", "gameGpu", "appMem", "gameMem" })
         {
-            var sa = a.Series[key];
-            var sb2 = b.Series[key];
-            if (!sa.HasData && !sb2.HasData) continue;
-            sb.AppendLine($"{Metrics.First(m => m.Key == key).Label,-42}{Fmt(sa.Max),10}{Fmt(sb2.Max),12}{"",18}  {Metrics.First(m => m.Key == key).Unit}");
+            var m = Metrics.First(x => x.Key == key);
+            if (!a.Series[key].HasData && !b.Series[key].HasData && !c.Series[key].HasData) continue;
+            sb.AppendLine($"{m.Label,-40}{Fmt(a.Series[key].Max),10}{Fmt(b.Series[key].Max),12}{Fmt(c.Series[key].Max),12}  {m.Unit}");
         }
         sb.AppendLine();
         sb.AppendLine("NOTES");
-        sb.AppendLine(new string('-', 78));
-        sb.AppendLine("- The canvas runs first, then per-window, so the GPU may be a little warmer for the second.");
+        sb.AppendLine(new string('-', 100));
+        sb.AppendLine("- The modes run in this order, so the GPU may be a little warmer for the later ones.");
         sb.AppendLine("  Differences under about 3% are noise. Run it again to check the result is repeatable.");
         sb.AppendLine("- 'GPU memory' is the dedicated memory Windows attributes to the process. The VR game's figure");
         sb.AppendLine("  includes the layer's copy of each overlay, so it moves with the overlay sizes too.");
         sb.AppendLine("- A game that changes its own memory use while this runs (loading a track) skews that row.");
         sb.AppendLine("- Workload: only one window changes per tick. If your windows all refresh every frame, the saving");
         sb.AppendLine("  in copying shrinks; the memory saving does not.");
+        sb.AppendLine("- 3D gives each window one overlay per eye (two shared textures, two layers, two copies per change),");
+        sb.AppendLine("  so it costs about double what a flat window does. That is what the second comparison shows.");
         return sb.ToString();
+    }
+
+    private static void AppendSummary(StringBuilder sb, string title, BenchmarkPhase from, BenchmarkPhase to, string[] keys)
+    {
+        sb.AppendLine(title);
+        sb.AppendLine(new string('-', 100));
+        var lines = keys.Select(k => Describe(from, to, k)).Where(l => l != null).ToList();
+        if (lines.Count == 0) lines.Add("No GPU counters could be read, so only frame time and copy volume are compared.");
+        foreach (var l in lines) sb.AppendLine(l);
+        sb.AppendLine();
     }
 
     // "GPU memory, VR game: 412 -> 301 MB (-27%, lower is better)"
@@ -452,7 +482,7 @@ public sealed class OverlayBenchmark : IDisposable
                 int rows = p!.Series["overlays"].Values.Count;
                 for (int i = 0; i < rows; i++)
                 {
-                    csv.Append(p.PerWindow ? "per-window" : "canvas").Append(',').Append(i + 1);
+                    csv.Append(p.Key).Append(',').Append(i + 1);
                     foreach (var m in Metrics.Where(m => m.Key != "frame"))
                     {
                         double v = p.Series[m.Key].Values[i];

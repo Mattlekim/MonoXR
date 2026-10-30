@@ -3354,7 +3354,10 @@ namespace MonoXR.Client
 
         private sealed class WindowOverlay
         {
-            public Overlay Ov = null!;
+            public Overlay Ov = null!;          // the left eye's when Right is set, otherwise both eyes'
+            public Overlay? Right;              // the right eye's, for a stereo window
+            public int ShiftPx;                 // the left eye's picture shift (the right eye's is the opposite)
+            public int PublishedShiftPx;
             public bool NeedsPublish = true;
             public bool Moved;          // placed away from its canvas position
             public Vector3 Position;
@@ -3372,6 +3375,43 @@ namespace MonoXR.Client
         {
             get => _perWindowRequested;
             set { if (_perWindowRequested == value) return; _perWindowRequested = value; _canvasDirty = true; }
+        }
+
+        /// <summary>
+        /// The 3D option: with one overlay per window, show each window as a pair of
+        /// overlays, one per eye, each with its own picture (the window's picture
+        /// shifted by the disparity <see cref="StereoDepth"/> asks for, or the window's
+        /// own <see cref="OverlayRenderTarget.RightEyeTarget"/>). A window that needs
+        /// no depth stays a single overlay. Has no effect on the single canvas.
+        /// </summary>
+        public bool Stereo3D
+        {
+            get => _stereo3D;
+            set { if (_stereo3D == value) return; _stereo3D = value; _canvasDirty = true; }
+        }
+
+        /// <summary>Meters every window's picture stands out of its frame toward the viewer (negative: behind it), for <see cref="Stereo3D"/>. Each window adds its own <see cref="OverlayRenderTarget.StereoDepthOffset"/>.</summary>
+        public float StereoDepth
+        {
+            get => _stereoDepth;
+            set { value = Math.Clamp(float.IsFinite(value) ? value : 0f, -2f, 3f); if (_stereoDepth == value) return; _stereoDepth = value; _canvasDirty = true; }
+        }
+
+        /// <summary>Distance between the eyes in meters, for working out the disparity.</summary>
+        public float StereoIpd
+        {
+            get => _stereoIpd;
+            set { value = Math.Clamp(float.IsFinite(value) ? value : 0.063f, 0.05f, 0.08f); if (_stereoIpd == value) return; _stereoIpd = value; _canvasDirty = true; }
+        }
+
+        private bool _stereo3D;
+        private float _stereoDepth = 0.2f;
+        private float _stereoIpd = 0.063f;
+
+        /// <summary>How many windows are shown as an overlay per eye right now.</summary>
+        public int StereoWindowCount
+        {
+            get { int n = 0; foreach (var w in _windows.Values) if (w.Right != null) n++; return n; }
         }
 
         /// <summary>True while the windows really are published one overlay each (the option is on and nothing forces the canvas).</summary>
@@ -3406,7 +3446,7 @@ namespace MonoXR.Client
                 // The cursor quad, the edit-toggle quad, and whatever carries the panels
                 // (the canvas overlay's stub in per-window mode is never shown: not counted).
                 int n = 1 + (_toggleOverlay != null ? 1 : 0);
-                if (_perWindowActive) return n + _windows.Count;
+                if (_perWindowActive) return n + _windows.Values.Sum(w => w.Right != null ? 2 : 1);
                 return n + (_tripleOverlays?.Length ?? 1);
             }
         }
@@ -3431,7 +3471,7 @@ namespace MonoXR.Client
                 Add(_overlay);
                 Add(_cursorOverlay);
                 Add(_toggleOverlay);
-                foreach (var w in _windows.Values) Add(w.Ov);
+                foreach (var w in _windows.Values) { Add(w.Ov); Add(w.Right); }
                 if (_tripleOverlays != null) foreach (var o in _tripleOverlays) Add(o);
                 if (_canvasTarget != null) b += (long)_canvasTarget.Width * _canvasTarget.Height * 4;
                 if (_windowScratch != null) b += (long)_windowScratch.Width * _windowScratch.Height * 4;
@@ -3506,7 +3546,7 @@ namespace MonoXR.Client
 
         private void DisposeWindowOverlays()
         {
-            foreach (var w in _windows.Values) w.Ov.Dispose();
+            foreach (var w in _windows.Values) { w.Ov.Dispose(); w.Right?.Dispose(); }
             _windows.Clear();
         }
 
@@ -3532,19 +3572,23 @@ namespace MonoXR.Client
             bool curved = _appliedCurved;
             float radius = CurveRadius;
 
+            // Slots a stereo window can take on top of its first one.
+            int spare = MaxWindowOverlays;
+            foreach (var t in _targets) if (t.Visible && !t.IsSkipped(false)) spare--;
+
             for (int i = 0; i < _targets.Count; i++)
             {
                 var rt = _targets[i];
                 if (!rt.Visible || rt.IsSkipped(false))
                 {
-                    if (_windows.Remove(rt, out var gone)) gone.Ov.Dispose();
+                    if (_windows.Remove(rt, out var gone)) { gone.Ov.Dispose(); gone.Right?.Dispose(); }
                     continue;
                 }
 
                 int dw = rt.DisplayWidth, dh = rt.DisplayHeight;
                 if (!_windows.TryGetValue(rt, out var w) || w.Ov.Width != dw || w.Ov.Height != dh)
                 {
-                    if (w != null) w.Ov.Dispose();
+                    if (w != null) { w.Ov.Dispose(); w.Right?.Dispose(); }
                     Overlay ov;
                     try { ov = _mgr.CreateOverlay(dw, dh); }
                     catch (InvalidOperationException) { _windows.Remove(rt); continue; } // out of slots: this window stays unshown
@@ -3600,16 +3644,61 @@ namespace MonoXR.Client
                 w.Rotation = frame * rot;
                 w.SizeMeters = new Vector2(wm, hm);
 
-                var o = w.Ov;
-                o.Space = _overlay.Space;
-                o.Position = w.Position;
-                o.Rotation = w.Rotation;
-                o.Size = w.SizeMeters;
-                o.CurveRadius = curve;
-                o.ZOrder = i;
-                o.Visible = true;
-                // Not before the first frame is in: the slot would show an empty texture.
-                if (!w.NeedsPublish) o.UpdatePose();
+                // 3D: a window whose picture should stand out of (or sink behind) its frame,
+                // or that has a picture of its own for the right eye, becomes a pair of
+                // overlays, one per eye. The disparity is what the two eyes see of a point
+                // at the wanted depth, drawn on the window's plane.
+                float depth = _stereoDepth + rt.StereoDepthOffset;
+                bool stereo = _stereo3D && (depth != 0f || rt.RightEyeTarget != null);
+                if (stereo && w.Right == null)
+                {
+                    if (spare > 0)
+                    {
+                        try { w.Right = _mgr.CreateOverlay(dw, dh); spare--; w.NeedsPublish = true; _canvasDirty = true; }
+                        catch (InvalidOperationException) { stereo = false; }
+                    }
+                    else stereo = false;
+                }
+                else if (stereo) spare--; // already has its second overlay
+                if (!stereo && w.Right != null)
+                {
+                    w.Right.Dispose();
+                    w.Right = null;
+                    w.NeedsPublish = true; // the one overlay now shows both eyes: draw it unshifted
+                    _canvasDirty = true;
+                }
+
+                int shift = 0;
+                if (w.Right != null)
+                {
+                    float dist = MathF.Max(0.2f, pos.Length());       // from the view origin to the window
+                    float z = MathF.Max(0.15f, dist - depth);         // where the picture should seem to be
+                    float k = _stereoIpd / 2f * (1f - dist / z);      // the left eye's view of it, on the plane; the right eye's is -k
+                    shift = (int)MathF.Round(-k * dw / MathF.Max(wm, 1e-3f));
+                    shift = Math.Clamp(shift, -dw / 4, dw / 4);
+                }
+                if (shift != w.ShiftPx || (w.Right != null && w.PublishedShiftPx != shift))
+                {
+                    w.ShiftPx = shift;
+                    w.NeedsPublish = true;
+                    _canvasDirty = true;
+                }
+
+                void Place(Overlay o, MonoXrEye eye)
+                {
+                    o.Space = _overlay.Space;
+                    o.Position = w.Position;
+                    o.Rotation = w.Rotation;
+                    o.Size = w.SizeMeters;
+                    o.CurveRadius = curve;
+                    o.ZOrder = i;
+                    o.Eye = eye;
+                    o.Visible = true;
+                    // Not before the first frame is in: the slot would show an empty texture.
+                    if (!w.NeedsPublish) o.UpdatePose();
+                }
+                Place(w.Ov, w.Right != null ? MonoXrEye.Left : MonoXrEye.Both);
+                if (w.Right != null) Place(w.Right, MonoXrEye.Right);
             }
         }
 
@@ -3632,23 +3721,42 @@ namespace MonoXR.Client
             var ov = w.Ov;
             int dw = ov.Width, dh = ov.Height;
 
-            // A panel at its own size and full opacity is copied straight from its target.
-            bool ok;
-            if (rt.Width == dw && rt.Height == dh && rt.SourceWidth == dw && rt.SourceHeight == dh && rt.Opacity >= 0.999f)
-                ok = ov.Update(MonoGameInterop.GetTexturePointer(rt.Target));
-            else
+            // A stereo window: each eye's overlay gets its own picture.
+            if (w.Right != null)
             {
-                // Scaled, collapsed or faded: draw it as the canvas would have, then copy that.
-                var scratch = EnsureWindowScratch(dw, dh);
-                GraphicsDevice.SetRenderTarget(scratch);
-                GraphicsDevice.Clear(XnaColor.Transparent);
-                _compositor.Begin(SpriteSortMode.Deferred, BlendState.AlphaBlend, SamplerState.LinearClamp);
-                _compositor.Draw(rt.Target, new XnaRectangle(0, 0, dw, dh),
-                    new XnaRectangle(0, 0, rt.SourceWidth, rt.SourceHeight), XnaColor.White * rt.Opacity);
-                _compositor.End();
-                GraphicsDevice.SetRenderTarget(null);
-                ok = ov.Update(MonoGameInterop.GetTexturePointer(scratch), 0, 0);
+                bool left = PublishEye(rt, ov, rt.Target, w.ShiftPx);
+                bool right = PublishEye(rt, w.Right, rt.RightEyeTarget ?? rt.Target, -w.ShiftPx);
+                if (left && right) w.PublishedShiftPx = w.ShiftPx;
+                return left && right;
             }
+            w.PublishedShiftPx = 0;
+
+            // A panel at its own size and full opacity is copied straight from its target.
+            if (rt.Width == dw && rt.Height == dh && rt.SourceWidth == dw && rt.SourceHeight == dh && rt.Opacity >= 0.999f)
+            {
+                bool direct = ov.Update(MonoGameInterop.GetTexturePointer(rt.Target));
+                if (direct) PublishedPixels += (long)dw * dh;
+                return direct;
+            }
+            // Scaled, collapsed or faded: draw it as the canvas would have, then copy that.
+            return PublishEye(rt, ov, rt.Target, 0);
+        }
+
+        // Draw one picture of a window, moved sideways by shiftPx, into the scratch target
+        // as the canvas would have composed it, then copy that into the overlay.
+        private bool PublishEye(OverlayRenderTarget rt, Overlay ov, RenderTarget2D picture, int shiftPx)
+        {
+            int dw = ov.Width, dh = ov.Height;
+            var scratch = EnsureWindowScratch(dw, dh);
+            GraphicsDevice.SetRenderTarget(scratch);
+            GraphicsDevice.Clear(XnaColor.Transparent);
+            _compositor.Begin(SpriteSortMode.Deferred, BlendState.AlphaBlend, SamplerState.LinearClamp);
+            _compositor.Draw(picture, new XnaRectangle(shiftPx, 0, dw, dh),
+                new XnaRectangle(0, 0, Math.Min(rt.SourceWidth, picture.Width), Math.Min(rt.SourceHeight, picture.Height)),
+                XnaColor.White * rt.Opacity);
+            _compositor.End();
+            GraphicsDevice.SetRenderTarget(null);
+            bool ok = ov.Update(MonoGameInterop.GetTexturePointer(scratch), 0, 0);
             if (ok) PublishedPixels += (long)dw * dh;
             return ok;
         }
