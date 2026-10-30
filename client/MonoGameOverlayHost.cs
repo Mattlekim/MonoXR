@@ -1056,6 +1056,9 @@ namespace MonoXR.Client
         /// <summary>A window's title bar was shown or hidden from the right-click menu (see <see cref="OverlayRenderTarget.TitleBarHidden"/>): save the layout.</summary>
         public event Action? TitleBarsChanged;
 
+        /// <summary>A window's own right-click item (hide headings, ...) changed it: save the layout.</summary>
+        public event Action? PanelOptionsChanged;
+
         /// <summary>The saved groups, each a list of panels that move together.</summary>
         public IReadOnlyList<IReadOnlyList<OverlayRenderTarget>> Groups => _groups;
 
@@ -1140,6 +1143,17 @@ namespace MonoXR.Client
             if (sel.Any(m => GroupOf(m) != null)) _ctxItems.Add(("Ungroup", UngroupSelection));
             _ctxItems.Add(("Center vertically", () => CenterSelection(vertical: true)));
             _ctxItems.Add(("Center horizontally", () => CenterSelection(vertical: false)));
+            foreach (var (label, run) in hit.EditMenuItems())
+            {
+                var item = run;
+                _ctxItems.Add((label, () =>
+                {
+                    item();
+                    ClampToCanvas(hit);
+                    _canvasDirty = true;
+                    PanelOptionsChanged?.Invoke();
+                }));
+            }
             var withTitle = sel.Where(m => m.TitleBarSourceHeight > 0).ToList();
             if (withTitle.Count > 0)
             {

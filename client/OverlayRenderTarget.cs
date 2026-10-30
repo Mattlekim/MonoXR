@@ -172,6 +172,19 @@ namespace MonoXR.Client
         public int SourceWidth => IsCollapsed ? Math.Min(CollapsedWidth, Width) : Width;
         public int SourceHeight => IsCollapsed ? Math.Min(CollapsedHeight, Height) : Height - SourceTop;
 
+        /// <summary>True for a window with a row of column headings that can be hidden (see <see cref="HeadingsHidden"/>).</summary>
+        public virtual bool HasHeadings => false;
+
+        /// <summary>Hide the column headings row of a window that has one; the window then starts its rows right under the title / info bar.</summary>
+        public virtual bool HeadingsHidden { get => false; set { } }
+
+        /// <summary>Extra items for the edit-mode right-click menu on this window (label and what it does). Changing something that way saves the layout.</summary>
+        public virtual System.Collections.Generic.IEnumerable<(string Label, System.Action Run)> EditMenuItems()
+        {
+            if (HasHeadings)
+                yield return (HeadingsHidden ? "Show headings" : "Hide headings", () => HeadingsHidden = !HeadingsHidden);
+        }
+
         /// <summary>Height of the title bar at the top of this target's picture, for targets that draw one (0: none). See <see cref="TitleBarHidden"/>.</summary>
         public virtual int TitleBarSourceHeight => 0;
 
