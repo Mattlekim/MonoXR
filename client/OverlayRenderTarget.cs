@@ -232,6 +232,24 @@ namespace MonoXR.Client
         /// <summary>Spin about the window's own normal, degrees.</summary>
         public float RollDegrees { get; set; }
 
+        /// <summary>
+        /// Meters this window's picture stands out of its frame (positive, toward the
+        /// viewer) or sinks behind it (negative), added to the host's
+        /// <see cref="MonoGameOverlayHost.StereoDepth"/>. Only while
+        /// <see cref="MonoGameOverlayHost.Stereo3D"/> is on, when the window is shown by
+        /// one overlay per eye and each eye's picture is shifted to match.
+        /// </summary>
+        public float StereoDepthOffset { get; set; }
+
+        /// <summary>
+        /// A picture for the right eye, same size as <see cref="Target"/> (for stereo
+        /// video, say). While <see cref="MonoGameOverlayHost.Stereo3D"/> is on the host
+        /// shows <see cref="Target"/> to the left eye and this to the right; null shows
+        /// <see cref="Target"/> to both. Keep it drawn, and call <see cref="Invalidate"/>
+        /// when it changes. The host does not own it: dispose it yourself.
+        /// </summary>
+        public RenderTarget2D? RightEyeTarget { get; set; }
+
         /// <summary>True when any of the 3D placement values differs from "where the canvas puts it".</summary>
         public bool HasPlacementOverride =>
             DistanceOffset != 0f || YawDegrees != 0f || PitchDegrees != 0f || RollDegrees != 0f;

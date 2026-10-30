@@ -33,6 +33,14 @@ public static class MonoXrConstants
     public const ulong KeyConsumer = 1ul;
 }
 
+/// <summary>Which eye an overlay is shown to (bits 1-2 of <see cref="MonoXrOverlaySlot.Visible"/>).</summary>
+public enum MonoXrEye : uint
+{
+    Both = 0,
+    Left = 1,
+    Right = 2,
+}
+
 public enum MonoXrSpace : uint
 {
     World = 0, // stationary in the play space (LOCAL)
@@ -43,7 +51,7 @@ public enum MonoXrSpace : uint
 public unsafe struct MonoXrOverlaySlot
 {
     public uint Active;
-    public uint Visible;
+    public uint Visible;    // bit 0: shown; bits 1-2: MonoXrEye (0 = both eyes)
     public uint Space;      // MonoXrSpace
     public uint TexWidth;
     public uint TexHeight;

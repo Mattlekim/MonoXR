@@ -18,6 +18,17 @@
 #define MONOXR_MAX_OVERLAYS 16u
 #define MONOXR_NAME_LEN     64u           // wchar_t count incl. null
 
+// Which eye an overlay is shown to (bits 1-2 of MonoXrOverlaySlot.visible).
+// The values are XrEyeVisibility's, so the layer passes them straight through.
+enum MonoXrEye {
+    MONOXR_EYE_BOTH  = 0,
+    MONOXR_EYE_LEFT  = 1,
+    MONOXR_EYE_RIGHT = 2,
+};
+#define MONOXR_VISIBLE_SHOWN     1u
+#define MONOXR_VISIBLE_EYE_SHIFT 1u
+#define MONOXR_VISIBLE_EYE_MASK  3u
+
 // Reference space an overlay's pose is expressed in.
 enum MonoXrSpace {
     MONOXR_SPACE_WORLD = 0,  // stationary in the play space (XR_REFERENCE_SPACE_TYPE_LOCAL)
@@ -29,7 +40,10 @@ enum MonoXrSpace {
 // One overlay = one MonoGame RenderTarget published as a shared texture.
 struct MonoXrOverlaySlot {
     uint32_t active;    // client owns this slot
-    uint32_t visible;   // draw it this frame
+    // Bit 0: draw it this frame. Bits 1-2: which eye sees it (MonoXrEye; 0 = both,
+    // so every older client, which writes only 0 or 1, still means "both eyes").
+    // Kept inside this word so the control block layout and version are unchanged.
+    uint32_t visible;
     uint32_t space;     // MonoXrSpace
     uint32_t texWidth;
     uint32_t texHeight;
