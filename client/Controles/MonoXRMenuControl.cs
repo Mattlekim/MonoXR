@@ -36,6 +36,15 @@ namespace MonoXR.Client
             SyncSelection();
         }
 
+        /// <summary>Selects <paramref name="item"/> (if it is in the menu and enabled).</summary>
+        public void Select(MonoXRControl item)
+        {
+            int i = _items.IndexOf(item);
+            if (i < 0 || !item.IsEnabled) return;
+            _selected = i;
+            SyncSelection();
+        }
+
         public void Clear()
         {
             _items.Clear();

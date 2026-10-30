@@ -170,7 +170,39 @@ namespace MonoXR.Client
 
         /// <summary>Texture region that is composited (collapsed bar or the full target), in target pixels.</summary>
         public int SourceWidth => IsCollapsed ? Math.Min(CollapsedWidth, Width) : Width;
-        public int SourceHeight => IsCollapsed ? Math.Min(CollapsedHeight, Height) : Height;
+        public int SourceHeight => IsCollapsed ? Math.Min(CollapsedHeight, Height) : Height - SourceTop;
+
+        /// <summary>True for a window with a row of column headings that can be hidden (see <see cref="HeadingsHidden"/>).</summary>
+        public virtual bool HasHeadings => false;
+
+        /// <summary>Hide the column headings row of a window that has one; the window then starts its rows right under the title / info bar.</summary>
+        public virtual bool HeadingsHidden { get => false; set { } }
+
+        /// <summary>Extra items for the edit-mode right-click menu on this window (label and what it does). Changing something that way saves the layout.</summary>
+        public virtual System.Collections.Generic.IEnumerable<(string Label, System.Action Run)> EditMenuItems()
+        {
+            if (HasHeadings)
+                yield return (HeadingsHidden ? "Show headings" : "Hide headings", () => HeadingsHidden = !HeadingsHidden);
+        }
+
+        /// <summary>Height of the title bar at the top of this target's picture, for targets that draw one (0: none). See <see cref="TitleBarHidden"/>.</summary>
+        public virtual int TitleBarSourceHeight => 0;
+
+        private bool _titleBarHidden;
+
+        /// <summary>
+        /// Leave the title bar out of what is shown: the window then starts under it. Only
+        /// for targets that report a <see cref="TitleBarSourceHeight"/>; a collapsed target
+        /// always shows its name.
+        /// </summary>
+        public bool TitleBarHidden
+        {
+            get => _titleBarHidden;
+            set { if (_titleBarHidden == value) return; _titleBarHidden = value; Invalidate(); }
+        }
+
+        /// <summary>First row of the picture that is shown (below a hidden title bar).</summary>
+        public int SourceTop => _titleBarHidden && !IsCollapsed ? Math.Clamp(TitleBarSourceHeight, 0, Math.Max(0, Height - 1)) : 0;
 
         public const float MinScale = 0.4f;
         public const float MaxScale = 3f;
@@ -233,6 +265,14 @@ namespace MonoXR.Client
         public float RollDegrees { get; set; }
 
         /// <summary>
+        /// Bend this window around the viewer on a vertical cylinder (needs a runtime with
+        /// cylinder layers, otherwise it stays flat). 0 is flat, 1 wraps it evenly around
+        /// the viewer so every point is the same distance away, less is a gentler curve and
+        /// more a tighter one. The window then turns to face the viewer.
+        /// </summary>
+        public float CurveAmount { get; set; }
+
+        /// <summary>
         /// Meters this window's picture stands out of its frame (positive, toward the
         /// viewer) or sinks behind it (negative), added to the host's
         /// <see cref="MonoGameOverlayHost.StereoDepth"/>. Only while
@@ -252,7 +292,7 @@ namespace MonoXR.Client
 
         /// <summary>True when any of the 3D placement values differs from "where the canvas puts it".</summary>
         public bool HasPlacementOverride =>
-            DistanceOffset != 0f || YawDegrees != 0f || PitchDegrees != 0f || RollDegrees != 0f;
+            DistanceOffset != 0f || YawDegrees != 0f || PitchDegrees != 0f || RollDegrees != 0f || CurveAmount != 0f;
 
         /// <summary>Size currently occupied on the canvas: the source region times <see cref="Scale"/>.</summary>
         public int DisplayWidth => Math.Max(1, (int)MathF.Round(SourceWidth * _scale));
@@ -330,6 +370,16 @@ namespace MonoXR.Client
 
         /// <summary>The pointer left this target (or edit mode began): drop any hover highlight.</summary>
         public virtual void OnPointerExit() { }
+
+        /// <summary>
+        /// Pointer resting over this target IN edit mode (no button held), in target-local
+        /// pixels, for the topmost target under the cursor only. For targets with controls of
+        /// their own, such as a drop-down list, that highlight what a press would pick.
+        /// </summary>
+        public virtual void OnEditHover(int x, int y) { }
+
+        /// <summary>The pointer left this target (or a button was pressed, or edit mode ended): drop any <see cref="OnEditHover"/> highlight.</summary>
+        public virtual void OnEditHoverExit() { }
 
         /// <summary>
         /// Right-button press inside this target OUTSIDE edit mode, in
