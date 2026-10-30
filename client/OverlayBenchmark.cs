@@ -525,7 +525,7 @@ internal sealed class GpuCounterReader : IDisposable
 
     private const double MB = 1024.0 * 1024.0;
 
-    private readonly Timer _timer;
+    private readonly System.Threading.Timer _timer;
     private readonly int _clientPid = Environment.ProcessId;
     private int _gamePid;
     private int _busy;
@@ -542,7 +542,7 @@ internal sealed class GpuCounterReader : IDisposable
 
     public GpuCounterReader()
     {
-        _timer = new Timer(_ => Poll(), null, 0, 1000);
+        _timer = new System.Threading.Timer(_ => Poll(), null, 0, 1000);
     }
 
     private void Poll()
