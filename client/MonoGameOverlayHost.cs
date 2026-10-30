@@ -855,7 +855,7 @@ namespace MonoXR.Client
                 if (_editMode == value) return;
                 _editMode = value;
                 _canvasDirty = true;
-                if (!value) { _selected = null; _group.Clear(); _marquee = false; _groupDrag = false; _showMenuOpen = false; _ctxOpen = false; CloseDocks(); }
+                if (!value) { _selected = null; _group.Clear(); _marquee = false; _groupDrag = false; _groupResize = false; _showMenuOpen = false; _ctxOpen = false; CloseDocks(); }
                 EditModeChanged?.Invoke(value);
                 // Let targets react (e.g. draw a placeholder while edited).
                 foreach (var rt in _targets)
@@ -1250,7 +1250,7 @@ namespace MonoXR.Client
         /// or size slider) that feeds back on itself.
         /// </summary>
         public bool IsPointerGestureActive =>
-            _dragTarget != null || _resizeTarget != null || _editCapture != null || _pointerCapture != null;
+            _dragTarget != null || _resizeTarget != null || _editCapture != null || _pointerCapture != null || _groupResize;
 
         /// <summary>
         /// Raised when the user finishes resizing a target in edit mode (a
@@ -1451,7 +1451,7 @@ namespace MonoXR.Client
             _calStep = 1;
             _calWaitRelease = true;
             _dragTarget = null; _editCapture = null; _resizeTarget = null; _selected = null;
-            _group.Clear(); _marquee = false; _groupDrag = false;
+            _group.Clear(); _marquee = false; _groupDrag = false; _groupResize = false;
             _canvasDirty = true;
             return true;
         }
@@ -1553,6 +1553,7 @@ namespace MonoXR.Client
             if (!EditMode)
             {
                 if (_groupDrag) EndGroupDrag();
+                if (_groupResize) EndGroupResize();
                 _marquee = false;
                 if (_dragTarget != null)
                 {
@@ -1662,6 +1663,14 @@ namespace MonoXR.Client
                     if (hit != null && !_group.Contains(hit) && GroupOf(hit) != null && !KeyDown(VK_CONTROL))
                         SetSelection(WithGroupmates(hit));
 
+                    // The corner grip of a multi-selection resizes the whole group.
+                    if (_group.Count >= 2 && GetGroupGrip().Contains(mx, my))
+                    {
+                        BeginGroupResize(mx, my);
+                        _lmbWasDown = lmb;
+                        return;
+                    }
+
                     // Pressing on a member of the group drags them all.
                     if (hit != null && _group.Contains(hit))
                     {
@@ -1726,6 +1735,10 @@ namespace MonoXR.Client
             {
                 EndGroupDrag();
             }
+            else if (!lmb && _groupResize)
+            {
+                EndGroupResize();
+            }
             else if (!lmb && _marquee)
             {
                 _marquee = false;
@@ -1767,6 +1780,10 @@ namespace MonoXR.Client
             else if (lmb && _groupDrag)
             {
                 MoveGroupTo(mx - _groupPressX, my - _groupPressY);
+            }
+            else if (lmb && _groupResize)
+            {
+                ResizeGroupTo(mx, my);
             }
             else if (lmb && _marquee)
             {
@@ -1861,6 +1878,81 @@ namespace MonoXR.Client
             }
         }
 
+        // ----- Resizing the whole group -----------------------------------------
+        // A multi-selection shows one grip on the bottom-right corner of its
+        // combined bounds. Dragging it scales every member by the same factor
+        // about the bounds' top-left corner, so the arrangement keeps its shape.
+        private bool _groupResize;
+        private XnaRectangle _groupResizeBounds;
+        private readonly Dictionary<OverlayRenderTarget, (int X, int Y, float Scale)> _groupResizeStart = new();
+
+        private XnaRectangle GroupBounds()
+        {
+            int l = int.MaxValue, t = int.MaxValue, r = int.MinValue, b = int.MinValue;
+            foreach (var rt in _group)
+            {
+                l = Math.Min(l, rt.X);
+                t = Math.Min(t, rt.Y);
+                r = Math.Max(r, rt.X + rt.DisplayWidth);
+                b = Math.Max(b, rt.Y + rt.DisplayHeight);
+            }
+            return _group.Count == 0 ? XnaRectangle.Empty : new XnaRectangle(l, t, r - l, b - t);
+        }
+
+        private XnaRectangle GetGroupGrip()
+        {
+            var bounds = GroupBounds();
+            int size = Math.Min(ResizeGripSize, Math.Min(bounds.Width, bounds.Height));
+            return new XnaRectangle(bounds.Right - size, bounds.Bottom - size, size, size);
+        }
+
+        private void BeginGroupResize(int mx, int my)
+        {
+            _groupResize = true;
+            _groupResizeBounds = GroupBounds();
+            _groupResizeStart.Clear();
+            foreach (var rt in _group) _groupResizeStart[rt] = (rt.X, rt.Y, rt.Scale);
+            _canvasDirty = true;
+        }
+
+        private void ResizeGroupTo(int mx, int my)
+        {
+            var b = _groupResizeBounds;
+            if (b.Width < 1 || b.Height < 1) return;
+
+            // The bottom-right corner follows the cursor (the axis asking for
+            // more drives it), limited so every member stays within its allowed
+            // scale and the group within the canvas.
+            float f = Math.Max((mx - b.X) / (float)b.Width, (my - b.Y) / (float)b.Height);
+            float lo = 0f, hi = float.MaxValue;
+            foreach (var (_, st) in _groupResizeStart)
+            {
+                lo = Math.Max(lo, OverlayRenderTarget.MinScale / st.Scale);
+                hi = Math.Min(hi, OverlayRenderTarget.MaxScale / st.Scale);
+            }
+            hi = Math.Min(hi, Math.Min((CanvasWidth - b.X) / (float)b.Width, (CanvasHeight - b.Y) / (float)b.Height));
+            f = Math.Clamp(f, lo, Math.Max(lo, hi));
+
+            foreach (var (rt, st) in _groupResizeStart)
+            {
+                rt.Scale = st.Scale * f;
+                rt.X = b.X + (int)MathF.Round((st.X - b.X) * f);
+                rt.Y = b.Y + (int)MathF.Round((st.Y - b.Y) * f);
+            }
+            _canvasDirty = true;
+        }
+
+        private void EndGroupResize()
+        {
+            _groupResize = false;
+            _canvasDirty = true;
+            foreach (var rt in _group)
+            {
+                DragCompleted?.Invoke(rt);
+                ScaleChanged?.Invoke(rt);
+            }
+        }
+
         private void EndGroupDrag()
         {
             _groupDrag = false;
@@ -1892,7 +1984,7 @@ namespace MonoXR.Client
             int dx = (KeyDown(VK_RIGHT) ? 1 : 0) - (KeyDown(VK_LEFT) ? 1 : 0);
             int dy = (KeyDown(VK_DOWN) ? 1 : 0) - (KeyDown(VK_UP) ? 1 : 0);
 
-            bool busy = _dragTarget != null || _resizeTarget != null || _editCapture != null || _groupDrag;
+            bool busy = _dragTarget != null || _resizeTarget != null || _editCapture != null || _groupDrag || _groupResize;
             if (rt == null || busy || (dx == 0 && dy == 0))
             {
                 if (_nudgeMoved && _nudgeTarget != null)
@@ -2626,7 +2718,7 @@ namespace MonoXR.Client
         {
             _compositor.Begin(SpriteSortMode.Deferred, BlendState.AlphaBlend, SamplerState.PointClamp);
             int dw = rt.DisplayWidth, dh = rt.DisplayHeight;
-            bool active = rt == _dragTarget || rt == _resizeTarget || (_groupDrag && _group.Contains(rt));
+            bool active = rt == _dragTarget || rt == _resizeTarget || ((_groupDrag || _groupResize) && _group.Contains(rt));
             var c = active                                   ? XnaColor.Lime
                   : rt == _selected || _group.Contains(rt)   ? XnaColor.Cyan
                                                              : XnaColor.Yellow;
@@ -2635,9 +2727,10 @@ namespace MonoXR.Client
             _compositor.Draw(_whitePixel, new XnaRectangle(rt.X, rt.Y, 2, dh), c);
             _compositor.Draw(_whitePixel, new XnaRectangle(rt.X + dw - 2, rt.Y, 2, dh), c);
 
-            if (rt == _selected && !rt.IsCollapsed)
+            bool lastOfGroup = _group.Count >= 2 && _group[^1] == rt;
+            if (rt == _selected && !rt.IsCollapsed || lastOfGroup)
             {
-                var grip = GetResizeGrip(rt);
+                var grip = lastOfGroup ? GetGroupGrip() : GetResizeGrip(rt);
                 const int bar = 5;
                 for (int i = 0; i * bar < grip.Width; i++)
                 {
