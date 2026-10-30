@@ -6,6 +6,7 @@ using Microsoft.Xna.Framework.Graphics;
 using GameTime = Microsoft.Xna.Framework.GameTime;
 using MonoXR.Shared;
 using XnaColor = Microsoft.Xna.Framework.Color;
+using XnaPoint = Microsoft.Xna.Framework.Point;
 using XnaRectangle = Microsoft.Xna.Framework.Rectangle;
 using XnaVector2 = Microsoft.Xna.Framework.Vector2;
 
@@ -314,15 +315,45 @@ namespace MonoXR.Client
         }
 
         /// <summary>
-        /// Meters of canvas the top screen adds above the normal area: its height
-        /// while it is on, otherwise 0. The caller sizes the canvas as
-        /// (<see cref="DisplaySize"/>.Y + this) x pixels per meter.
+        /// A screen below the centre one (needs <see cref="Triple"/>), mirroring
+        /// the top screen: as wide as the centre screen, <see cref="TripleBottomHeight"/>
+        /// tall and tipped back by <see cref="TripleBottomAngle"/> so it faces up
+        /// at the viewer. Its picture is an extra band along the bottom of the canvas.
         /// </summary>
-        public float CanvasExtraHeightMeters => _triple && _tripleTop ? _tripleTopHeight : 0f;
+        public bool TripleBottom
+        {
+            get => _tripleBottom;
+            set { _tripleBottom = value; ApplyPose(); }
+        }
 
-        private bool _triple, _appliedTriple, _tripleTop;
+        /// <summary>Height of the bottom screen in meters.</summary>
+        public float TripleBottomHeight
+        {
+            get => _tripleBottomHeight;
+            set { _tripleBottomHeight = Math.Clamp(value, 0.2f, 4f); ApplyPose(); }
+        }
+
+        /// <summary>How far the bottom screen tips toward the viewer, in degrees: 0 is upright, 90 faces straight up.</summary>
+        public float TripleBottomAngle
+        {
+            get => _tripleBottomAngle;
+            set { _tripleBottomAngle = Math.Clamp(value, 0f, 90f); ApplyPose(); }
+        }
+
+        /// <summary>
+        /// Meters of canvas the top and bottom screens add above and below the
+        /// normal area: their heights while they are on, otherwise 0. The caller
+        /// sizes the canvas as (<see cref="DisplaySize"/>.Y + this) x pixels per meter.
+        /// </summary>
+        public float CanvasExtraHeightMeters => ExtraTopMeters + ExtraBottomMeters;
+
+        private float ExtraTopMeters => _triple && _tripleTop ? _tripleTopHeight : 0f;
+        private float ExtraBottomMeters => _triple && _tripleBottom ? _tripleBottomHeight : 0f;
+
+        private bool _triple, _appliedTriple, _tripleTop, _tripleBottom;
         private float _tripleCenter = 50f, _tripleAngle = 30f, _tripleTopHeight = 1f, _tripleTopAngle = 30f;
-        private Overlay[]? _tripleOverlays; // left, centre, right (and top); only while Triple is on
+        private float _tripleBottomHeight = 1f, _tripleBottomAngle = 30f;
+        private Overlay[]? _tripleOverlays; // left, centre, right (then top, then bottom); only while Triple is on
 
         // One screen of the triple layout: the canvas columns it shows, its
         // width in meters, and where it sits in the view origin's frame (a yaw
@@ -336,33 +367,59 @@ namespace MonoXR.Client
         private static Quaternion SegmentRotation(TripleSegment s) =>
             Quaternion.CreateFromAxisAngle(Vector3.UnitY, s.Yaw) * Quaternion.CreateFromAxisAngle(Vector3.UnitX, s.Pitch);
 
-        // Height in canvas pixels of the band along the top of the canvas that the
-        // top screen shows (0 without one): its share of the canvas height.
-        private int BandPx()
+        // Heights in canvas pixels of the bands along the top and bottom of the
+        // canvas that the top and bottom screens show (0 without one): their
+        // share of the canvas height.
+        private void BandsPx(out int top, out int bottom)
         {
-            float extraM = CanvasExtraHeightMeters;
-            if (extraM <= 0f) return 0;
+            top = bottom = 0;
+            float topM = ExtraTopMeters, botM = ExtraBottomMeters;
+            if (topM <= 0f && botM <= 0f) return;
             int h = CanvasHeight;
-            float mainM = _overlay.Size.Y;
-            int mainPx = Math.Clamp((int)MathF.Round(h * mainM / (mainM + extraM)), 1, Math.Max(1, h - 1));
-            return h - mainPx;
+            float totalM = _overlay.Size.Y + topM + botM;
+            if (topM > 0f) top = Math.Max(1, (int)MathF.Round(h * topM / totalM));
+            if (botM > 0f) bottom = Math.Max(1, (int)MathF.Round(h * botM / totalM));
+            // Always leave at least a pixel row for the main screens.
+            while (top + bottom > h - 1 && (top > 1 || bottom > 1))
+            {
+                if (top >= bottom && top > 1) top--; else bottom--;
+            }
         }
 
-        // The band height the panels were last arranged around; they are moved
-        // by the difference when the canvas is rebuilt with a different band.
-        private int _bandPxApplied;
+        private int BandPx() { BandsPx(out int top, out _); return top; }
+        private int BottomBandPx() { BandsPx(out _, out int bottom); return bottom; }
 
-        // Left, centre, right, then the top screen when there is one.
+        // Where the centre screen's top-left corner sits on the canvas that the
+        // panels were last arranged around.
+        private XnaPoint _originApplied;
+
+        /// <summary>
+        /// The canvas position of the centre screen's top-left corner. Saved
+        /// panel positions are measured from it, so they stay with the centre
+        /// screen when the layout (top / bottom screens, centre width) changes.
+        /// Flat and curved canvases have no side screens: it is the canvas corner.
+        /// </summary>
+        public XnaPoint CenterOrigin => _originApplied;
+
+        private XnaPoint ComputeCenterOrigin()
+        {
+            if (!_triple) return XnaPoint.Zero;
+            var c = TripleLayout()[1];
+            return new XnaPoint(c.X0, c.Y0);
+        }
+
+        // Left, centre, right, then the top and bottom screens when there are any.
         private TripleSegment[] TripleLayout()
         {
             Vector2 size = _overlay.Size;
             int w = CanvasWidth, h = CanvasHeight;
 
-            // The top screen's band runs along the top of the canvas; the other
-            // three screens show what is below it.
-            float extraM = CanvasExtraHeightMeters;
-            int topPx = BandPx();
-            int mainPx = h - topPx;
+            // The top screen's band runs along the top of the canvas and the
+            // bottom screen's along the bottom; the other three screens show
+            // what is between them.
+            float topM = ExtraTopMeters, botM = ExtraBottomMeters;
+            BandsPx(out int topPx, out int botPx);
+            int mainPx = h - topPx - botPx;
 
             int centerPx = Math.Clamp((int)MathF.Round(w * _tripleCenter / 100f), 1, Math.Max(1, w - 2));
             int leftPx = (w - centerPx) / 2, rightPx = w - centerPx - leftPx;
@@ -385,12 +442,23 @@ namespace MonoXR.Client
 
             // The top screen hinges on the centre screen's top edge and tips
             // forward (its top toward the viewer, so its face looks down).
-            if (extraM > 0f && topPx >= 1)
+            if (topM > 0f && topPx >= 1)
             {
                 float pitch = _tripleTopAngle * MathF.PI / 180f;
                 var hinge = new Vector3(_offsetX, _offsetY + size.Y / 2f, z);
-                segs.Add(new TripleSegment(leftPx, 0, centerPx, topPx, cm, extraM, 0f, pitch,
-                    hinge + new Vector3(0f, extraM / 2f * MathF.Cos(pitch), extraM / 2f * MathF.Sin(pitch))));
+                segs.Add(new TripleSegment(leftPx, 0, centerPx, topPx, cm, topM, 0f, pitch,
+                    hinge + new Vector3(0f, topM / 2f * MathF.Cos(pitch), topM / 2f * MathF.Sin(pitch))));
+            }
+
+            // The bottom screen hinges on the centre screen's bottom edge and
+            // tips toward the viewer (its bottom edge comes forward, so its
+            // face looks up).
+            if (botM > 0f && botPx >= 1)
+            {
+                float pitch = _tripleBottomAngle * MathF.PI / 180f;
+                var hinge = new Vector3(_offsetX, _offsetY - size.Y / 2f, z);
+                segs.Add(new TripleSegment(leftPx, h - botPx, centerPx, botPx, cm, botM, 0f, -pitch,
+                    hinge + new Vector3(0f, -botM / 2f * MathF.Cos(pitch), botM / 2f * MathF.Sin(pitch))));
             }
             return segs.ToArray();
         }
@@ -469,11 +537,33 @@ namespace MonoXR.Client
             return true;
         }
 
+        // Panels keep their place relative to the centre screen: when its corner
+        // moves on the canvas (a top / bottom screen appears, the centre screen
+        // is made wider, the shape changes) they move with it.
+        private void ShiftToCenterOrigin()
+        {
+            var origin = ComputeCenterOrigin();
+            if (origin == _originApplied) return;
+            int dx = origin.X - _originApplied.X, dy = origin.Y - _originApplied.Y;
+            _originApplied = origin;
+            foreach (var rt in _targets)
+            {
+                if (rt.IsDocked) continue;
+                // Not clamped here: the canvas is often still the old size (it is
+                // rebuilt right after a shape change), which would squash panels
+                // against its edge. SetCanvasResolution clamps once it is rebuilt.
+                rt.X += dx;
+                rt.Y += dy;
+            }
+            _canvasDirty = true;
+        }
+
         private void ApplyPose()
         {
             // Yaw then pitch, no roll: forward = (-cos p * sin y, sin p, -cos p * cos y).
             var rotation = Quaternion.CreateFromYawPitchRoll(OriginYaw, OriginPitch, 0f);
             _appliedTriple = _triple;
+            ShiftToCenterOrigin();
             if (_appliedTriple)
             {
                 // Three flat screens; the single canvas overlay is hidden and
@@ -765,7 +855,7 @@ namespace MonoXR.Client
                 if (_editMode == value) return;
                 _editMode = value;
                 _canvasDirty = true;
-                if (!value) { _selected = null; _group.Clear(); _marquee = false; _groupDrag = false; _showMenuOpen = false; _ctxOpen = false; CloseDocks(); }
+                if (!value) { _selected = null; _group.Clear(); _marquee = false; _groupDrag = false; _groupResize = false; _showMenuOpen = false; _ctxOpen = false; CloseDocks(); }
                 EditModeChanged?.Invoke(value);
                 // Let targets react (e.g. draw a placeholder while edited).
                 foreach (var rt in _targets)
@@ -1093,6 +1183,7 @@ namespace MonoXR.Client
             if (sel.Count == 0) return;
 
             int band = BandPx();
+            int bottomBand = BottomBandPx();
             int start, length;
             if (sel.Count >= 2)
             {
@@ -1109,7 +1200,7 @@ namespace MonoXR.Client
             else
             {
                 start = vertical ? band : 0;
-                length = vertical ? CanvasHeight - band : CanvasWidth;
+                length = vertical ? CanvasHeight - band - bottomBand : CanvasWidth;
             }
             int center = start + length / 2;
 
@@ -1159,7 +1250,7 @@ namespace MonoXR.Client
         /// or size slider) that feeds back on itself.
         /// </summary>
         public bool IsPointerGestureActive =>
-            _dragTarget != null || _resizeTarget != null || _editCapture != null || _pointerCapture != null;
+            _dragTarget != null || _resizeTarget != null || _editCapture != null || _pointerCapture != null || _groupResize;
 
         /// <summary>
         /// Raised when the user finishes resizing a target in edit mode (a
@@ -1360,7 +1451,7 @@ namespace MonoXR.Client
             _calStep = 1;
             _calWaitRelease = true;
             _dragTarget = null; _editCapture = null; _resizeTarget = null; _selected = null;
-            _group.Clear(); _marquee = false; _groupDrag = false;
+            _group.Clear(); _marquee = false; _groupDrag = false; _groupResize = false;
             _canvasDirty = true;
             return true;
         }
@@ -1434,6 +1525,18 @@ namespace MonoXR.Client
                 my = Math.Clamp(p.Y * CanvasHeight / screenH, 0, CanvasHeight - 1);
             }
 
+            // On the top or bottom screen the pointer stays between that screen's
+            // left and right edges; it cannot slide off onto columns it doesn't show.
+            if (_appliedTriple)
+            {
+                BandsPx(out int topPx, out int botPx);
+                if (topPx > 0 && my < topPx || botPx > 0 && my >= CanvasHeight - botPx)
+                {
+                    var c = TripleLayout()[1];
+                    mx = Math.Clamp(mx, c.X0, c.X0 + c.Px - 1);
+                }
+            }
+
             if (mx != _cursorX || my != _cursorY)
             {
                 _cursorX = mx;
@@ -1450,6 +1553,7 @@ namespace MonoXR.Client
             if (!EditMode)
             {
                 if (_groupDrag) EndGroupDrag();
+                if (_groupResize) EndGroupResize();
                 _marquee = false;
                 if (_dragTarget != null)
                 {
@@ -1559,6 +1663,14 @@ namespace MonoXR.Client
                     if (hit != null && !_group.Contains(hit) && GroupOf(hit) != null && !KeyDown(VK_CONTROL))
                         SetSelection(WithGroupmates(hit));
 
+                    // The corner grip of a multi-selection resizes the whole group.
+                    if (_group.Count >= 2 && GetGroupGrip().Contains(mx, my))
+                    {
+                        BeginGroupResize(mx, my);
+                        _lmbWasDown = lmb;
+                        return;
+                    }
+
                     // Pressing on a member of the group drags them all.
                     if (hit != null && _group.Contains(hit))
                     {
@@ -1623,6 +1735,10 @@ namespace MonoXR.Client
             {
                 EndGroupDrag();
             }
+            else if (!lmb && _groupResize)
+            {
+                EndGroupResize();
+            }
             else if (!lmb && _marquee)
             {
                 _marquee = false;
@@ -1664,6 +1780,10 @@ namespace MonoXR.Client
             else if (lmb && _groupDrag)
             {
                 MoveGroupTo(mx - _groupPressX, my - _groupPressY);
+            }
+            else if (lmb && _groupResize)
+            {
+                ResizeGroupTo(mx, my);
             }
             else if (lmb && _marquee)
             {
@@ -1758,6 +1878,81 @@ namespace MonoXR.Client
             }
         }
 
+        // ----- Resizing the whole group -----------------------------------------
+        // A multi-selection shows one grip on the bottom-right corner of its
+        // combined bounds. Dragging it scales every member by the same factor
+        // about the bounds' top-left corner, so the arrangement keeps its shape.
+        private bool _groupResize;
+        private XnaRectangle _groupResizeBounds;
+        private readonly Dictionary<OverlayRenderTarget, (int X, int Y, float Scale)> _groupResizeStart = new();
+
+        private XnaRectangle GroupBounds()
+        {
+            int l = int.MaxValue, t = int.MaxValue, r = int.MinValue, b = int.MinValue;
+            foreach (var rt in _group)
+            {
+                l = Math.Min(l, rt.X);
+                t = Math.Min(t, rt.Y);
+                r = Math.Max(r, rt.X + rt.DisplayWidth);
+                b = Math.Max(b, rt.Y + rt.DisplayHeight);
+            }
+            return _group.Count == 0 ? XnaRectangle.Empty : new XnaRectangle(l, t, r - l, b - t);
+        }
+
+        private XnaRectangle GetGroupGrip()
+        {
+            var bounds = GroupBounds();
+            int size = Math.Min(ResizeGripSize, Math.Min(bounds.Width, bounds.Height));
+            return new XnaRectangle(bounds.Right - size, bounds.Bottom - size, size, size);
+        }
+
+        private void BeginGroupResize(int mx, int my)
+        {
+            _groupResize = true;
+            _groupResizeBounds = GroupBounds();
+            _groupResizeStart.Clear();
+            foreach (var rt in _group) _groupResizeStart[rt] = (rt.X, rt.Y, rt.Scale);
+            _canvasDirty = true;
+        }
+
+        private void ResizeGroupTo(int mx, int my)
+        {
+            var b = _groupResizeBounds;
+            if (b.Width < 1 || b.Height < 1) return;
+
+            // The bottom-right corner follows the cursor (the axis asking for
+            // more drives it), limited so every member stays within its allowed
+            // scale and the group within the canvas.
+            float f = Math.Max((mx - b.X) / (float)b.Width, (my - b.Y) / (float)b.Height);
+            float lo = 0f, hi = float.MaxValue;
+            foreach (var (_, st) in _groupResizeStart)
+            {
+                lo = Math.Max(lo, OverlayRenderTarget.MinScale / st.Scale);
+                hi = Math.Min(hi, OverlayRenderTarget.MaxScale / st.Scale);
+            }
+            hi = Math.Min(hi, Math.Min((CanvasWidth - b.X) / (float)b.Width, (CanvasHeight - b.Y) / (float)b.Height));
+            f = Math.Clamp(f, lo, Math.Max(lo, hi));
+
+            foreach (var (rt, st) in _groupResizeStart)
+            {
+                rt.Scale = st.Scale * f;
+                rt.X = b.X + (int)MathF.Round((st.X - b.X) * f);
+                rt.Y = b.Y + (int)MathF.Round((st.Y - b.Y) * f);
+            }
+            _canvasDirty = true;
+        }
+
+        private void EndGroupResize()
+        {
+            _groupResize = false;
+            _canvasDirty = true;
+            foreach (var rt in _group)
+            {
+                DragCompleted?.Invoke(rt);
+                ScaleChanged?.Invoke(rt);
+            }
+        }
+
         private void EndGroupDrag()
         {
             _groupDrag = false;
@@ -1789,7 +1984,7 @@ namespace MonoXR.Client
             int dx = (KeyDown(VK_RIGHT) ? 1 : 0) - (KeyDown(VK_LEFT) ? 1 : 0);
             int dy = (KeyDown(VK_DOWN) ? 1 : 0) - (KeyDown(VK_UP) ? 1 : 0);
 
-            bool busy = _dragTarget != null || _resizeTarget != null || _editCapture != null || _groupDrag;
+            bool busy = _dragTarget != null || _resizeTarget != null || _editCapture != null || _groupDrag || _groupResize;
             if (rt == null || busy || (dx == 0 && dy == 0))
             {
                 if (_nudgeMoved && _nudgeTarget != null)
@@ -1972,6 +2167,7 @@ namespace MonoXR.Client
         // selected, dragged, or given the button bar.
         private const int DockTabWidth = 56;
         private const int DockTabHeight = 180;
+        private const int DockTabGap = 12;       // between stacked tabs on one edge
         private const int DockMargin = 16;   // clear space kept around an open panel
 
         private void LayoutDocks()
@@ -1983,7 +2179,7 @@ namespace MonoXR.Client
 
                 // Shrink a panel that is too big for the canvas so it always fits.
                 // Centred on the screens below the top screen's band, not on the whole canvas.
-                int band = BandPx(), area = CanvasHeight - band;
+                int band = BandPx(), area = CanvasHeight - band - BottomBandPx();
                 float fit = MathF.Min(1f, MathF.Min((area - DockMargin) / (float)rt.Height,
                                                     (CanvasWidth - DockTabWidth - DockMargin) / (float)rt.Width));
                 rt.Scale = Math.Max(OverlayRenderTarget.MinScale, fit);
@@ -2010,9 +2206,14 @@ namespace MonoXR.Client
 
         private XnaRectangle GetDockTab(OverlayRenderTarget rt)
         {
-            int band = BandPx(), area = CanvasHeight - band; // centred below the top screen's band
-            int h = Math.Min(DockTabHeight, area);
-            int y = band + (area - h) / 2;
+            int band = BandPx(), area = CanvasHeight - band - BottomBandPx(); // centred between the top and bottom screens' bands
+
+            // Several tabs on one edge stack top to bottom (in the order the
+            // panels were added), the group centred on the screens.
+            var side = EditDocks().Where(d => d.DockSide == rt.DockSide).ToList();
+            int n = Math.Max(1, side.Count), index = Math.Max(0, side.IndexOf(rt));
+            int h = Math.Min(DockTabHeight, Math.Max(1, (area - DockTabGap * (n - 1)) / n));
+            int y = band + (area - (n * h + (n - 1) * DockTabGap)) / 2 + index * (h + DockTabGap);
             int panel = rt.DockOpen ? rt.DisplayWidth : 0;
             int x = rt.DockSide == OverlayDockSide.Right ? CanvasWidth - panel - DockTabWidth : panel;
             return new XnaRectangle(x, y, DockTabWidth, h);
@@ -2026,7 +2227,13 @@ namespace MonoXR.Client
                 if (GetDockTab(rt).Contains(mx, my))
                 {
                     rt.DockOpen = !rt.DockOpen;
-                    if (rt.DockOpen) BringToFront(rt);
+                    if (rt.DockOpen)
+                    {
+                        // Panels on the same edge would sit on top of each other: one at a time.
+                        foreach (var other in EditDocks())
+                            if (other != rt && other.DockSide == rt.DockSide) other.DockOpen = false;
+                        BringToFront(rt);
+                    }
                     _selected = null;
                     _canvasDirty = true;
                     return true;
@@ -2375,19 +2582,9 @@ namespace MonoXR.Client
             _canvasTarget = new RenderTarget2D(GraphicsDevice, width, height);
             foreach (var rt in _targets) rt.Invalidate();
 
-            // The top screen's band sits above everything, so when it appears,
-            // grows or goes, the panels move with the rest of the canvas.
-            int band = BandPx();
-            if (band != _bandPxApplied)
-            {
-                foreach (var rt in _targets)
-                {
-                    rt.Y += band - _bandPxApplied;
-                    ClampToCanvas(rt);
-                }
-                _bandPxApplied = band;
-            }
+            // (ApplyPose below moves the panels with the centre screen's corner.)
             ApplyPose(); // also rebuilds the triple screens at the new size
+            foreach (var rt in _targets) ClampToCanvas(rt);
         }
 
         /// <summary>
@@ -2533,7 +2730,7 @@ namespace MonoXR.Client
         {
             _compositor.Begin(SpriteSortMode.Deferred, BlendState.AlphaBlend, SamplerState.PointClamp);
             int dw = rt.DisplayWidth, dh = rt.DisplayHeight;
-            bool active = rt == _dragTarget || rt == _resizeTarget || (_groupDrag && _group.Contains(rt));
+            bool active = rt == _dragTarget || rt == _resizeTarget || ((_groupDrag || _groupResize) && _group.Contains(rt));
             var c = active                                   ? XnaColor.Lime
                   : rt == _selected || _group.Contains(rt)   ? XnaColor.Cyan
                                                              : XnaColor.Yellow;
@@ -2542,9 +2739,10 @@ namespace MonoXR.Client
             _compositor.Draw(_whitePixel, new XnaRectangle(rt.X, rt.Y, 2, dh), c);
             _compositor.Draw(_whitePixel, new XnaRectangle(rt.X + dw - 2, rt.Y, 2, dh), c);
 
-            if (rt == _selected && !rt.IsCollapsed)
+            bool lastOfGroup = _group.Count >= 2 && _group[^1] == rt;
+            if (rt == _selected && !rt.IsCollapsed || lastOfGroup)
             {
-                var grip = GetResizeGrip(rt);
+                var grip = lastOfGroup ? GetGroupGrip() : GetResizeGrip(rt);
                 const int bar = 5;
                 for (int i = 0; i * bar < grip.Width; i++)
                 {
@@ -2554,6 +2752,16 @@ namespace MonoXR.Client
                 }
             }
             _compositor.End();
+        }
+
+        // Four red edges just inside the given canvas rectangle; the compositor must be inside Begin/End.
+        private void DrawRedFrame(int x, int y, int w, int h, int t)
+        {
+            t = Math.Min(t, Math.Max(1, Math.Min(w, h) / 2));
+            _compositor.Draw(_whitePixel, new XnaRectangle(x, y, w, t), XnaColor.Red);
+            _compositor.Draw(_whitePixel, new XnaRectangle(x, y + h - t, w, t), XnaColor.Red);
+            _compositor.Draw(_whitePixel, new XnaRectangle(x, y + t, t, h - 2 * t), XnaColor.Red);
+            _compositor.Draw(_whitePixel, new XnaRectangle(x + w - t, y + t, t, h - 2 * t), XnaColor.Red);
         }
 
         /// <summary>Composite every target (and the edit-mode chrome) onto the bound, cleared canvas.</summary>
@@ -2590,22 +2798,27 @@ namespace MonoXR.Client
 
                 int t = Math.Max(1, EditBorderThickness);
                 int w = _canvasTarget.Width, h = _canvasTarget.Height;
-                _compositor.Draw(_whitePixel, new XnaRectangle(0, 0, w, t), XnaColor.Red);
-                _compositor.Draw(_whitePixel, new XnaRectangle(0, h - t, w, t), XnaColor.Red);
-                _compositor.Draw(_whitePixel, new XnaRectangle(0, t, t, h - 2 * t), XnaColor.Red);
-                _compositor.Draw(_whitePixel, new XnaRectangle(w - t, t, t, h - 2 * t), XnaColor.Red);
 
-                // With a top screen, only the middle columns of the band along the
-                // top of the canvas are shown in VR: dim the rest, and mark where
-                // the band ends.
-                if (_appliedTriple && _tripleOverlays is { Length: 4 })
+                // A red frame around every screen as it is seen in VR: the whole
+                // canvas when there is one screen, otherwise each of the three
+                // (or four, five) screens on its own slice of the canvas.
+                if (_appliedTriple && _tripleOverlays != null)
                 {
-                    var top = TripleLayout()[3];
+                    var segs = TripleLayout();
+                    foreach (var seg in segs) DrawRedFrame(seg.X0, seg.Y0, seg.Px, seg.Py, t);
+
+                    // The top and bottom screens show only the centre columns of
+                    // their bands: dim the rest, which is not shown anywhere.
                     var dim = XnaColor.Black * 0.6f;
-                    _compositor.Draw(_whitePixel, new XnaRectangle(0, 0, top.X0, top.Py), dim);
-                    _compositor.Draw(_whitePixel, new XnaRectangle(top.X0 + top.Px, 0, w - top.X0 - top.Px, top.Py), dim);
-                    _compositor.Draw(_whitePixel, new XnaRectangle(0, top.Py - 1, w, 2), XnaColor.Yellow * 0.8f);
+                    for (int i = 3; i < segs.Length; i++)
+                    {
+                        _compositor.Draw(_whitePixel, new XnaRectangle(0, segs[i].Y0, segs[i].X0, segs[i].Py), dim);
+                        _compositor.Draw(_whitePixel, new XnaRectangle(segs[i].X0 + segs[i].Px, segs[i].Y0,
+                                                                       w - segs[i].X0 - segs[i].Px, segs[i].Py), dim);
+                    }
                 }
+                else
+                    DrawRedFrame(0, 0, w, h, t);
 
                 // Hidden targets: just their name and a Show button.
                 foreach (var rt in _targets)
@@ -2694,7 +2907,9 @@ namespace MonoXR.Client
                 var frame = Quaternion.CreateFromYawPitchRoll(OriginYaw, OriginPitch, 0f);
                 var segs = TripleLayout();
                 float cx = _cursorX + 0.5f, cy = _cursorY + 0.5f;
-                var seg = segs.Length == 4 && cy < segs[3].Py ? segs[3] // the extra band along the top: the top screen
+                BandsPx(out int topPx, out int botPx);
+                var seg = topPx > 0 && cy < topPx ? segs[3] // the extra band along the top: the top screen
+                        : botPx > 0 && cy >= CanvasHeight - botPx ? segs[^1] // along the bottom: the bottom screen
                         : cx < segs[1].X0 ? segs[0] : cx < segs[2].X0 ? segs[1] : segs[2];
                 float lx = ((cx - seg.X0) / seg.Px - 0.5f) * seg.WidthM;
                 float ly = (0.5f - (cy - seg.Y0) / seg.Py) * seg.HeightM;
