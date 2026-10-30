@@ -1053,6 +1053,9 @@ namespace MonoXR.Client
         /// <summary>Raised after the user groups or ungroups panels, so the app can remember it.</summary>
         public event Action? GroupsChanged;
 
+        /// <summary>A window's title bar was shown or hidden from the right-click menu (see <see cref="OverlayRenderTarget.TitleBarHidden"/>): save the layout.</summary>
+        public event Action? TitleBarsChanged;
+
         /// <summary>The saved groups, each a list of panels that move together.</summary>
         public IReadOnlyList<IReadOnlyList<OverlayRenderTarget>> Groups => _groups;
 
@@ -1137,6 +1140,17 @@ namespace MonoXR.Client
             if (sel.Any(m => GroupOf(m) != null)) _ctxItems.Add(("Ungroup", UngroupSelection));
             _ctxItems.Add(("Center vertically", () => CenterSelection(vertical: true)));
             _ctxItems.Add(("Center horizontally", () => CenterSelection(vertical: false)));
+            var withTitle = sel.Where(m => m.TitleBarSourceHeight > 0).ToList();
+            if (withTitle.Count > 0)
+            {
+                bool allHidden = withTitle.All(m => m.TitleBarHidden);
+                _ctxItems.Add((allHidden ? "Show title bar" : "Hide title bar", () =>
+                {
+                    foreach (var m in withTitle) { m.TitleBarHidden = !allHidden; ClampToCanvas(m); }
+                    _canvasDirty = true;
+                    TitleBarsChanged?.Invoke();
+                }));
+            }
 
             _ctxX = mx;
             _ctxY = my;
@@ -1330,7 +1344,7 @@ namespace MonoXR.Client
 
         // Canvas point -> target-local pixels (the target's texture is drawn stretched by Scale).
         private static int ToLocalX(OverlayRenderTarget rt, int canvasX) => (int)((canvasX - rt.X) / rt.Scale);
-        private static int ToLocalY(OverlayRenderTarget rt, int canvasY) => (int)((canvasY - rt.Y) / rt.Scale);
+        private static int ToLocalY(OverlayRenderTarget rt, int canvasY) => (int)((canvasY - rt.Y) / rt.Scale) + rt.SourceTop;
 
         // Keep a target on the canvas after its displayed size changed.
         private void ClampToCanvas(OverlayRenderTarget rt)
@@ -1398,6 +1412,18 @@ namespace MonoXR.Client
             return true;
         }
 
+        // How far the game cursor is past the canvas edge it is pushing against, in canvas pixels.
+        private float _edgeSlackX, _edgeSlackY;
+
+        private static int SlackClamp(float mapped, int size, ref float slack)
+        {
+            float pos = mapped + slack;
+            float max = size - 1;
+            if (pos > max) { slack -= pos - max; pos = max; }
+            else if (pos < 0f) { slack -= pos; pos = 0f; }
+            return (int)pos;
+        }
+
         // Calibration: canvas fraction = scale * game-window fraction + offset,
         // per axis. Identity (1, 0) = the game window maps onto the whole canvas.
         private float _calScaleX = 1f, _calOffsetX, _calScaleY = 1f, _calOffsetY;
@@ -1413,6 +1439,7 @@ namespace MonoXR.Client
         public void SetCursorCalibration(float scaleX, float offsetX, float scaleY, float offsetY)
         {
             if (!float.IsFinite(scaleX + offsetX + scaleY + offsetY) || scaleX == 0f || scaleY == 0f) return;
+            _edgeSlackX = _edgeSlackY = 0f;
             _calScaleX = scaleX; _calOffsetX = offsetX;
             _calScaleY = scaleY; _calOffsetY = offsetY;
             CursorCalibrated = true;
@@ -1422,6 +1449,7 @@ namespace MonoXR.Client
         /// <summary>Forget the calibration: the game window maps onto the whole canvas again.</summary>
         public void ResetCursorCalibration()
         {
+            _edgeSlackX = _edgeSlackY = 0f;
             _calScaleX = _calScaleY = 1f;
             _calOffsetX = _calOffsetY = 0f;
             CursorCalibrated = false;
@@ -1521,8 +1549,12 @@ namespace MonoXR.Client
             {
                 // Game attached: its window (not the monitor) is what the game
                 // maps onto its in-VR cursor; the calibration fits that to the canvas.
-                mx = Math.Clamp((int)((_calScaleX * gu + _calOffsetX) * CanvasWidth), 0, CanvasWidth - 1);
-                my = Math.Clamp((int)((_calScaleY * gv + _calOffsetY) * CanvasHeight), 0, CanvasHeight - 1);
+                // The game window can reach past the canvas, so the real cursor keeps
+                // moving after the crosshair hits the canvas edge. Push the edge along
+                // instead (_edgeSlack), or the crosshair would not move on the way back
+                // until the cursor was back inside the canvas.
+                mx = SlackClamp((_calScaleX * gu + _calOffsetX) * CanvasWidth, CanvasWidth, ref _edgeSlackX);
+                my = SlackClamp((_calScaleY * gv + _calOffsetY) * CanvasHeight, CanvasHeight, ref _edgeSlackY);
             }
             else
             {
@@ -1560,6 +1592,7 @@ namespace MonoXR.Client
         {
             if (!EditMode)
             {
+                SetEditHover(null, 0, 0);
                 if (_groupDrag) EndGroupDrag();
                 if (_groupResize) EndGroupResize();
                 _marquee = false;
@@ -1617,6 +1650,7 @@ namespace MonoXR.Client
 
             if (!UpdateCursor()) return;
             int mx = _cursorX, my = _cursorY;
+            SetEditHover(_lmbWasDown ? null : HitTest(mx, my), mx, my);
 
             bool lmb = LeftButtonOverride?.Invoke()
                        ?? ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0);
@@ -2059,6 +2093,18 @@ namespace MonoXR.Client
                 _hoverTarget = rt;
             }
             rt?.OnPointerMove(ToLocalX(rt, mx), ToLocalY(rt, my));
+        }
+
+        private OverlayRenderTarget? _editHoverTarget; // target told about the pointer resting on it in edit mode
+
+        private void SetEditHover(OverlayRenderTarget? rt, int mx, int my)
+        {
+            if (!ReferenceEquals(rt, _editHoverTarget))
+            {
+                _editHoverTarget?.OnEditHoverExit();
+                _editHoverTarget = rt;
+            }
+            rt?.OnEditHover(ToLocalX(rt, mx), ToLocalY(rt, my));
         }
 
         private bool PollRightButton() =>
@@ -2621,6 +2667,7 @@ namespace MonoXR.Client
             UpdateEditInput();
             UpdateRenderMode();
             if (_perWindowActive) UpdateWindowPoses();
+            UpdateCanvasStereo();
             UpdateToggleOverlay();
             UpdateCursorOverlay();
 
@@ -2701,7 +2748,19 @@ namespace MonoXR.Client
                 // Calibrating the cursor: panels are hidden so nothing covers the
                 // game's own cursor; only the marker is drawn.
                 if (_calStep != 0) DrawCursorCalibration();
-                else ComposeTargets();
+                else ComposeTargets(_canvasStereo ? 1 : 0);
+                if (_canvasStereo)
+                {
+                    // 3D on the single canvas: the right eye gets a canvas of its own, every window shifted the other way.
+                    if (_canvasRight == null || _canvasRight.Width != canvas.Width || _canvasRight.Height != canvas.Height)
+                    {
+                        _canvasRight?.Dispose();
+                        _canvasRight = new RenderTarget2D(GraphicsDevice, canvas.Width, canvas.Height);
+                    }
+                    GraphicsDevice.SetRenderTarget(_canvasRight);
+                    GraphicsDevice.Clear(XnaColor.Transparent);
+                    ComposeTargets(-1);
+                }
                 GraphicsDevice.SetRenderTarget(null);
                 CanvasVersion++;
                 PreviewVersion++;
@@ -2729,8 +2788,20 @@ namespace MonoXR.Client
             }
             else
             {
+                bool stereoNow = _canvasStereo && _overlayRight != null && _canvasRight != null;
+                if (stereoNow)
+                {
+                    _overlay.Eye = MonoXrEye.Left;
+                    SyncRightCanvasPose();
+                }
                 published = _overlay.Update(MonoGameInterop.GetTexturePointer(canvas!));
                 if (published) PublishedPixels += (long)CanvasWidth * CanvasHeight;
+                if (stereoNow)
+                {
+                    bool right = _overlayRight!.Update(MonoGameInterop.GetTexturePointer(_canvasRight!));
+                    if (right) PublishedPixels += (long)CanvasWidth * CanvasHeight;
+                    published &= right;
+                }
             }
             _mgr.Heartbeat();
             if (published)
@@ -2803,7 +2874,9 @@ namespace MonoXR.Client
         }
 
         /// <summary>Composite every target (and the edit-mode chrome) onto the bound, cleared canvas.</summary>
-        private void ComposeTargets()
+        // eye: 0 the plain canvas, 1 the left eye's canvas, -1 the right eye's (3D on the single canvas):
+        // every window is drawn shifted by its disparity, and the right eye shows a window's own right-eye picture if it has one.
+        private void ComposeTargets(int eye = 0)
         {
             // Linear sampling: identical to point sampling for targets at 100%
             // (integer positions, 1:1 texels) and smooth for resized ones.
@@ -2819,10 +2892,12 @@ namespace MonoXR.Client
                 // Collapsed targets only contribute their top-left name-bar
                 // region (the subclass draws the bar there when collapsed).
                 // The source region is stretched to the Scale-d display size.
-                var src = new XnaRectangle(0, 0, rt.SourceWidth, rt.SourceHeight);
+                var src = new XnaRectangle(0, rt.SourceTop, rt.SourceWidth, rt.SourceHeight);
+                int shift = eye != 0 && _canvasShift.TryGetValue(rt, out int s) ? s * eye : 0;
+                var picture = eye < 0 && rt.RightEyeTarget != null ? rt.RightEyeTarget : rt.Target;
                 _compositor.Begin(SpriteSortMode.Deferred, BlendState.AlphaBlend, SamplerState.LinearClamp);
-                _compositor.Draw(rt.Target,
-                    new XnaRectangle(rt.X, rt.Y, rt.DisplayWidth, rt.DisplayHeight),
+                _compositor.Draw(picture,
+                    new XnaRectangle(rt.X + shift, rt.Y, rt.DisplayWidth, rt.DisplayHeight),
                     src, XnaColor.White * rt.Opacity);
                 _compositor.End();
 
@@ -3315,6 +3390,7 @@ namespace MonoXR.Client
             fresh.CurveRadius = old.CurveRadius;
             fresh.ZOrder = old.ZOrder;
             fresh.Visible = old.Visible;
+            fresh.Eye = old.Eye;
             old.Dispose();
             _overlay = fresh;
         }
@@ -3335,6 +3411,92 @@ namespace MonoXR.Client
         // calibration screen and triple screens still work on the canvas: while any
         // of those is up the host goes back to the single canvas overlay.
         // =====================================================================
+
+        // =====================================================================
+        // 3D on the single canvas
+        //
+        // With 3D on and no one-overlay-per-window, the whole canvas is shown as two
+        // overlays, one per eye. Each window is drawn into the left eye's canvas
+        // shifted one way and into the right eye's the other, by the disparity its
+        // depth asks for (StereoDepth plus the window's own StereoDepthOffset), so
+        // windows stand out of (or sink behind) the plane of the canvas. It is not
+        // used in edit mode, during the calibration or with the triple screens: those
+        // show the plain canvas. A canvas with no depth anywhere stays one overlay.
+        // =====================================================================
+
+        private Overlay? _overlayRight;
+        private RenderTarget2D? _canvasRight;
+        private bool _canvasStereo;
+        private readonly Dictionary<OverlayRenderTarget, int> _canvasShift = new();
+
+        private void UpdateCanvasStereo()
+        {
+            bool possible = _stereo3D && !_perWindowActive && !_appliedTriple && !_triple && !EditMode && _calStep == 0;
+            bool changed = false;
+            bool any = false;
+            Vector2 size = _overlay.Size;
+            if (possible && size.X > 0f && CanvasWidth > 0)
+            {
+                float mpx = size.X / CanvasWidth;               // meters per canvas pixel
+                float dist = MathF.Max(0.2f, _distance);         // from the view origin to the canvas
+                foreach (var rt in _targets)
+                {
+                    if (!rt.Visible || rt.IsSkipped(false)) continue;
+                    float depth = _stereoDepth + rt.StereoDepthOffset;
+                    int shift = 0;
+                    if (depth != 0f)
+                    {
+                        float z = MathF.Max(0.15f, dist - depth);           // where the picture should seem to be
+                        float k = _stereoIpd / 2f * (1f - dist / z);        // the left eye's view of it; the right eye's is -k
+                        shift = Math.Clamp((int)MathF.Round(-k / mpx), -rt.DisplayWidth / 4, rt.DisplayWidth / 4);
+                    }
+                    if (!_canvasShift.TryGetValue(rt, out int old) || old != shift)
+                    {
+                        _canvasShift[rt] = shift;
+                        changed = true;
+                    }
+                    any |= shift != 0 || rt.RightEyeTarget != null;
+                }
+            }
+            bool want = possible && any;
+
+            if (want && _overlayRight != null && (_overlayRight.Width != _overlay.Width || _overlayRight.Height != _overlay.Height))
+            {
+                _overlayRight.Dispose(); // the canvas was resized
+                _overlayRight = null;
+            }
+            if (want && _overlayRight == null)
+            {
+                try { _overlayRight = _mgr.CreateOverlay(_overlay.Width, _overlay.Height); }
+                catch (InvalidOperationException) { want = false; } // out of slots: stays a single canvas
+                _canvasDirty = true;
+            }
+            if (!want && _overlayRight != null)
+            {
+                _overlayRight.Dispose();
+                _overlayRight = null;
+                _canvasRight?.Dispose();
+                _canvasRight = null;
+                _overlay.Eye = MonoXrEye.Both; // the next publish shows the one canvas to both eyes again
+                _canvasDirty = true;
+            }
+            if (!want && _canvasShift.Count > 0) { _canvasShift.Clear(); _canvasDirty = true; }
+            if (want != _canvasStereo || (want && changed)) _canvasDirty = true;
+            _canvasStereo = want;
+        }
+
+        private void SyncRightCanvasPose()
+        {
+            var o = _overlayRight!;
+            o.Space = _overlay.Space;
+            o.Position = _overlay.Position;
+            o.Rotation = _overlay.Rotation;
+            o.Size = _overlay.Size;
+            o.CurveRadius = _overlay.CurveRadius;
+            o.ZOrder = _overlay.ZOrder;
+            o.Eye = MonoXrEye.Right;
+            o.Visible = _overlay.Visible;
+        }
 
         private bool _perWindowRequested;
         private bool _perWindowActive;
@@ -3470,11 +3632,13 @@ namespace MonoXR.Client
                 long b = 0;
                 void Add(Overlay? o) { if (o != null) b += (long)o.Width * o.Height * 4; }
                 Add(_overlay);
+                Add(_overlayRight);
                 Add(_cursorOverlay);
                 Add(_toggleOverlay);
                 foreach (var w in _windows.Values) { Add(w.Ov); Add(w.Right); }
                 if (_tripleOverlays != null) foreach (var o in _tripleOverlays) Add(o);
                 if (_canvasTarget != null) b += (long)_canvasTarget.Width * _canvasTarget.Height * 4;
+                if (_canvasRight != null) b += (long)_canvasRight.Width * _canvasRight.Height * 4;
                 if (_windowScratch != null) b += (long)_windowScratch.Width * _windowScratch.Height * 4;
                 return b;
             }
@@ -3613,6 +3777,9 @@ namespace MonoXR.Client
                 {
                     baseRot = Quaternion.Identity;
                     basePos = new Vector3(lx, ly, -_distance);
+                    // A window curved on its own turns to face the viewer, as on the shared curve.
+                    if (rt.CurveAmount > 0f)
+                        baseRot = Quaternion.CreateFromAxisAngle(Vector3.UnitY, -MathF.Atan2(basePos.X, -basePos.Z));
                 }
 
                 float wm = dw * mpx, hm = dh * mpy;
@@ -3640,6 +3807,9 @@ namespace MonoXR.Client
                     rot = baseRot * Quaternion.CreateFromYawPitchRoll(rt.YawDegrees * rad, rt.PitchDegrees * rad, rt.RollDegrees * rad);
                     curve = 0f; // a window that was turned by hand is a flat quad
                 }
+                // Its own curve: a cylinder around the viewer's vertical axis through the window.
+                if (rt.CurveAmount > 0f)
+                    curve = MathF.Max(0.3f, MathF.Sqrt(pos.X * pos.X + pos.Z * pos.Z)) / rt.CurveAmount;
 
                 w.Position = OriginPosition + Vector3.Transform(pos, frame);
                 w.Rotation = frame * rot;
@@ -3753,7 +3923,7 @@ namespace MonoXR.Client
             GraphicsDevice.Clear(XnaColor.Transparent);
             _compositor.Begin(SpriteSortMode.Deferred, BlendState.AlphaBlend, SamplerState.LinearClamp);
             _compositor.Draw(picture, new XnaRectangle(shiftPx, 0, dw, dh),
-                new XnaRectangle(0, 0, Math.Min(rt.SourceWidth, picture.Width), Math.Min(rt.SourceHeight, picture.Height)),
+                new XnaRectangle(0, rt.SourceTop, Math.Min(rt.SourceWidth, picture.Width), Math.Min(rt.SourceHeight, picture.Height - rt.SourceTop)),
                 XnaColor.White * rt.Opacity);
             _compositor.End();
             GraphicsDevice.SetRenderTarget(null);
@@ -3892,6 +4062,8 @@ namespace MonoXR.Client
             _compositor.Dispose();
             _previewTarget?.Dispose();
             _canvasTarget?.Dispose();
+            _canvasRight?.Dispose();
+            _overlayRight?.Dispose();
             _windowScratch?.Dispose();
             DisposeWindowOverlays();
             DisposeToggleOverlay();
