@@ -2167,6 +2167,7 @@ namespace MonoXR.Client
         // selected, dragged, or given the button bar.
         private const int DockTabWidth = 56;
         private const int DockTabHeight = 180;
+        private const int DockTabGap = 12;       // between stacked tabs on one edge
         private const int DockMargin = 16;   // clear space kept around an open panel
 
         private void LayoutDocks()
@@ -2206,8 +2207,13 @@ namespace MonoXR.Client
         private XnaRectangle GetDockTab(OverlayRenderTarget rt)
         {
             int band = BandPx(), area = CanvasHeight - band - BottomBandPx(); // centred between the top and bottom screens' bands
-            int h = Math.Min(DockTabHeight, area);
-            int y = band + (area - h) / 2;
+
+            // Several tabs on one edge stack top to bottom (in the order the
+            // panels were added), the group centred on the screens.
+            var side = EditDocks().Where(d => d.DockSide == rt.DockSide).ToList();
+            int n = Math.Max(1, side.Count), index = Math.Max(0, side.IndexOf(rt));
+            int h = Math.Min(DockTabHeight, Math.Max(1, (area - DockTabGap * (n - 1)) / n));
+            int y = band + (area - (n * h + (n - 1) * DockTabGap)) / 2 + index * (h + DockTabGap);
             int panel = rt.DockOpen ? rt.DisplayWidth : 0;
             int x = rt.DockSide == OverlayDockSide.Right ? CanvasWidth - panel - DockTabWidth : panel;
             return new XnaRectangle(x, y, DockTabWidth, h);
@@ -2221,7 +2227,13 @@ namespace MonoXR.Client
                 if (GetDockTab(rt).Contains(mx, my))
                 {
                     rt.DockOpen = !rt.DockOpen;
-                    if (rt.DockOpen) BringToFront(rt);
+                    if (rt.DockOpen)
+                    {
+                        // Panels on the same edge would sit on top of each other: one at a time.
+                        foreach (var other in EditDocks())
+                            if (other != rt && other.DockSide == rt.DockSide) other.DockOpen = false;
+                        BringToFront(rt);
+                    }
                     _selected = null;
                     _canvasDirty = true;
                     return true;
