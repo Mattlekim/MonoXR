@@ -707,14 +707,34 @@ static XrResult XRAPI_CALL MonoXr_xrEndFrame(XrSession session, const XrFrameEnd
         MonoXrOverlaySlot slot = s.control->slots[i]; // copy snapshot
         SlotResources& r = s.slots[i];
 
-        if (!slot.active || !slot.visible) {
-            if (r.swapchain != XR_NULL_HANDLE) { /* keep for reuse */ }
+        if (!slot.active) {
+            // The client let go of this slot (disposed the overlay, e.g. when it
+            // switched from one canvas to one overlay per window): give back the
+            // swapchain and the shared texture we opened. Without this the
+            // game's process would keep the old overlay's GPU memory until
+            // something else happened to reuse the slot.
+            if (r.swapchain != XR_NULL_HANDLE) {
+                down_xrDestroySwapchain(r.swapchain);
+                r.swapchain = XR_NULL_HANDLE;
+                r.images.clear();
+                r.width = r.height = r.format = 0;
+                r.lastFrameIndex = ~0ull;
+                r.hasContent = false;
+            }
+            r.releaseShared();
             continue;
         }
+        if (!(slot.visible & MONOXR_VISIBLE_SHOWN)) continue; // hidden but still owned: keep the swapchain for when it comes back
         if (slot.texWidth == 0 || slot.texHeight == 0) continue;
 
         XrSwapchainSubImage sub{};
         if (!RenderSlot(s, r, slot, sub)) continue;
+
+        // Which eye sees this layer: 0 both, 1 left, 2 right (XrEyeVisibility's own values).
+        const uint32_t eyeBits = (slot.visible >> MONOXR_VISIBLE_EYE_SHIFT) & MONOXR_VISIBLE_EYE_MASK;
+        const XrEyeVisibility eyeVis = eyeBits == MONOXR_EYE_LEFT  ? XR_EYE_VISIBILITY_LEFT
+                                     : eyeBits == MONOXR_EYE_RIGHT ? XR_EYE_VISIBILITY_RIGHT
+                                                                   : XR_EYE_VISIBILITY_BOTH;
 
         // A curved overlay goes out as a cylinder layer when the runtime has them;
         // otherwise it stays the flat quad it always was (the client knows from
@@ -724,7 +744,7 @@ static XrResult XRAPI_CALL MonoXr_xrEndFrame(XrSession session, const XrFrameEnd
             c.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT |
                            XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT;
             c.space = (slot.space == MONOXR_SPACE_HEAD) ? s.headSpace : s.worldSpace;
-            c.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+            c.eyeVisibility = eyeVis;
             c.subImage = sub;
             // The cylinder layer's pose is the cylinder's centre; the surface sits
             // `radius` in front of it (-Z). Move the centre back from the quad's
@@ -749,7 +769,7 @@ static XrResult XRAPI_CALL MonoXr_xrEndFrame(XrSession session, const XrFrameEnd
         q.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT |
                        XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT;
         q.space = (slot.space == MONOXR_SPACE_HEAD) ? s.headSpace : s.worldSpace;
-        q.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+        q.eyeVisibility = eyeVis;
         q.subImage = sub;
         q.pose.position = { slot.posX, slot.posY, slot.posZ };
         q.pose.orientation = { slot.quatX, slot.quatY, slot.quatZ, slot.quatW };
