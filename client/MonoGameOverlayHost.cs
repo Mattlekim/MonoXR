@@ -31,7 +31,11 @@ namespace MonoXR.Client
         private readonly OverlayManager _mgr;
         private Overlay _overlay;
         private readonly List<OverlayRenderTarget> _targets = new List<OverlayRenderTarget>();
-        private RenderTarget2D _canvasTarget;
+        // Null while the host runs one overlay per window and nothing needs the
+        // canvas (no desktop preview): the render target is the biggest single
+        // allocation here, so it is only held while it is used.
+        private RenderTarget2D? _canvasTarget;
+        private int _canvasW, _canvasH;
         private readonly SpriteBatch _compositor;
         private readonly Texture2D _whitePixel;
         private TimeSpan _lastTotal;
@@ -45,15 +49,15 @@ namespace MonoXR.Client
         public Overlay Overlay => _overlay;
 
         /// <summary>Pixel resolution of the overlay canvas (independent of the VR display size).</summary>
-        public int CanvasWidth => _canvasTarget.Width;
-        public int CanvasHeight => _canvasTarget.Height;
+        public int CanvasWidth => _canvasW;
+        public int CanvasHeight => _canvasH;
 
         /// <summary>
         /// The composed overlay canvas, for desktop previews (read it back with
         /// GetData). Do not hold on to the instance — it is replaced by
         /// <see cref="SetCanvasResolution"/>; re-fetch it each frame.
         /// </summary>
-        public Texture2D CanvasTexture => _canvasTarget;
+        public Texture2D CanvasTexture => TouchPreview();
 
         private RenderTarget2D? _previewTarget;
         private int _previewVersion = -1;
@@ -71,6 +75,7 @@ namespace MonoXR.Client
         /// </summary>
         public Texture2D GetPreviewTexture(int maxWidth, int maxHeight)
         {
+            var canvas = TouchPreview();
             int cw = CanvasWidth, ch = CanvasHeight;
             float fit = Math.Min(1f, Math.Min(Math.Max(1, maxWidth) / (float)cw, Math.Max(1, maxHeight) / (float)ch));
             int w = Math.Max(1, (int)MathF.Round(cw * fit));
@@ -89,7 +94,7 @@ namespace MonoXR.Client
                 GraphicsDevice.SetRenderTarget(_previewTarget);
                 // Opaque: a straight copy of the canvas's (premultiplied) pixels, alpha included.
                 _compositor.Begin(SpriteSortMode.Deferred, BlendState.Opaque, SamplerState.LinearClamp);
-                _compositor.Draw(_canvasTarget, new XnaRectangle(0, 0, w, h), XnaColor.White);
+                _compositor.Draw(canvas, new XnaRectangle(0, 0, w, h), XnaColor.White);
                 _compositor.End();
 
                 // The crosshair is a separate VR quad, not part of the canvas —
@@ -123,6 +128,7 @@ namespace MonoXR.Client
         public bool PresentPreview(SwapChainRenderTarget target, bool force = false)
         {
             if (_disposed) return false;
+            var canvas = TouchPreview();
             if (!force && ReferenceEquals(_presentedTo, target) && _presentedVersion == PreviewVersion) return false;
             _presentedTo = target;
             _presentedVersion = PreviewVersion;
@@ -140,7 +146,7 @@ namespace MonoXR.Client
             // The canvas holds premultiplied alpha, same as when it is composed
             // for VR: the default AlphaBlend lays it over the backing correctly.
             _compositor.Begin(SpriteSortMode.Deferred, BlendState.AlphaBlend, SamplerState.LinearClamp);
-            _compositor.Draw(_canvasTarget, new XnaRectangle(dx, dy, dw, dh), XnaColor.White);
+            _compositor.Draw(canvas, new XnaRectangle(dx, dy, dw, dh), XnaColor.White);
             _compositor.End();
 
             // The crosshair is a separate VR quad, not part of the canvas.
@@ -692,6 +698,7 @@ namespace MonoXR.Client
             // _distance along the origin's look direction, its own +X to the
             // right, +Y up and +Z back out toward the user.
             var quad = Quaternion.CreateFromYawPitchRoll(OriginYaw, OriginPitch, 0f);
+            if (_perWindowActive && RayHitsMovedWindow(eye, head, out x, out y)) return true;
             if (_appliedTriple) return CanvasPointOfRayTriple(eye, head, quad, size, out x, out y);
             if (_appliedCurved) return CanvasPointOfRayCurved(eye, head, quad, size, out x, out y);
 
@@ -2517,6 +2524,8 @@ namespace MonoXR.Client
             // GPU-side canvas the targets are composited into; published to the
             // overlay with a device-local CopyResource (both are R8G8B8A8_UNORM),
             // so no frame ever crosses to the CPU.
+            _canvasW = canvasWidth;
+            _canvasH = canvasHeight;
             _canvasTarget = new RenderTarget2D(GraphicsDevice, canvasWidth, canvasHeight);
             _compositor = new SpriteBatch(GraphicsDevice);
             _whitePixel = new Texture2D(GraphicsDevice, 1, 1);
@@ -2566,20 +2575,23 @@ namespace MonoXR.Client
             height = Math.Max(16, height);
             if (width == CanvasWidth && height == CanvasHeight) return;
 
-            var old = _overlay;
-            var newOverlay = _mgr.CreateOverlay(width, height);
-            newOverlay.Space = old.Space;
-            newOverlay.Position = old.Position;
-            newOverlay.Rotation = old.Rotation;
-            newOverlay.Size = old.Size;
-            newOverlay.CurveRadius = old.CurveRadius;
-            newOverlay.ZOrder = old.ZOrder;
-            newOverlay.Visible = old.Visible;
-            old.Dispose();
-            _overlay = newOverlay;
-
-            _canvasTarget.Dispose();
-            _canvasTarget = new RenderTarget2D(GraphicsDevice, width, height);
+            // With one overlay per window the canvas overlay is only a stub and
+            // the canvas target is not held: just remember the new size.
+            if (_perWindowActive)
+            {
+                _canvasW = width;
+                _canvasH = height;
+                _canvasTarget?.Dispose();
+                _canvasTarget = null;
+            }
+            else
+            {
+                ReplaceCanvasOverlay(width, height);
+                _canvasTarget?.Dispose();
+                _canvasW = width;
+                _canvasH = height;
+                _canvasTarget = new RenderTarget2D(GraphicsDevice, width, height);
+            }
             foreach (var rt in _targets) rt.Invalidate();
 
             // (ApplyPose below moves the panels with the centre screen's corner.)
@@ -2606,6 +2618,9 @@ namespace MonoXR.Client
             // between samples on capped ticks). Changes just mark things
             // dirty; the actual render still happens at the capped rate.
             UpdateEditInput();
+            UpdateRenderMode();
+            if (_perWindowActive) UpdateWindowPoses();
+            UpdateToggleOverlay();
             UpdateCursorOverlay();
 
             // Frame-rate cap: skip the whole frame if it is too soon. The
@@ -2633,6 +2648,7 @@ namespace MonoXR.Client
             // work AND the publish — the layer then keeps re-showing the last
             // frame for free. Heartbeat still runs so attach/detach tracking works.
             bool anyDirty = _canvasDirty || (_calStep == 0 && EditToggleVisible != _editToggleShown);
+            bool forcePublish = _canvasDirty;
             foreach (var rt in _targets)
             {
                 if (!rt.Visible) continue;
@@ -2649,6 +2665,8 @@ namespace MonoXR.Client
             // their existing texture and are just re-composited. A dormant
             // hidden target keeps its dirty flag, so it re-renders as soon as
             // it is shown.
+            _renderedThisFrame.Clear();
+            FramesProcessed++;
             foreach (var rt in _targets)
             {
                 if (!rt.IsDirty) continue;
@@ -2657,6 +2675,7 @@ namespace MonoXR.Client
                 GraphicsDevice.SetRenderTarget(rt.Target);
                 rt.Render(gameTime);
                 rt.ClearDirty();
+                _renderedThisFrame.Add(rt);
             }
 
             // Compose on the GPU: transparent canvas, then each visible target
@@ -2669,32 +2688,49 @@ namespace MonoXR.Client
             // canvas stays fully transparent in VR, and covered areas get the
             // target's own alpha (the layer submits with
             // BLEND_TEXTURE_SOURCE_ALPHA).
-            GraphicsDevice.SetRenderTarget(_canvasTarget);
-            GraphicsDevice.Clear(XnaColor.Transparent);
-            // Calibrating the cursor: panels are hidden so nothing covers the
-            // game's own cursor; only the marker is drawn.
-            if (_calStep != 0) DrawCursorCalibration();
-            else ComposeTargets();
-            GraphicsDevice.SetRenderTarget(null);
-            CanvasVersion++;
-            PreviewVersion++;
+            //
+            // With one overlay per window the canvas is not needed for VR at
+            // all, so it is only composed while a desktop preview is looking.
+            RenderTarget2D? canvas = null;
+            if (!_perWindowActive || PreviewWanted)
+            {
+                canvas = EnsureCanvasTarget();
+                GraphicsDevice.SetRenderTarget(canvas);
+                GraphicsDevice.Clear(XnaColor.Transparent);
+                // Calibrating the cursor: panels are hidden so nothing covers the
+                // game's own cursor; only the marker is drawn.
+                if (_calStep != 0) DrawCursorCalibration();
+                else ComposeTargets();
+                GraphicsDevice.SetRenderTarget(null);
+                CanvasVersion++;
+                PreviewVersion++;
+            }
 
             // Publish with a device-local GPU copy — no readback, no upload.
             // If the layer held the shared texture this instant (publish
             // skipped), stay dirty so the next frame retries — otherwise the
             // last change would never reach VR.
             bool published;
-            if (_appliedTriple && _tripleOverlays != null)
+            if (_perWindowActive)
+                published = PublishWindows(forcePublish);
+            else if (_appliedTriple && _tripleOverlays != null)
             {
                 // Each screen takes its own columns of the canvas.
                 var segs = TripleLayout();
-                IntPtr src = MonoGameInterop.GetTexturePointer(_canvasTarget);
+                IntPtr src = MonoGameInterop.GetTexturePointer(canvas!);
                 published = true;
                 for (int i = 0; i < _tripleOverlays.Length && i < segs.Length; i++)
-                    published &= _tripleOverlays[i].Update(src, segs[i].X0, segs[i].Y0);
+                {
+                    bool ok = _tripleOverlays[i].Update(src, segs[i].X0, segs[i].Y0);
+                    if (ok) PublishedPixels += (long)segs[i].Px * segs[i].Py;
+                    published &= ok;
+                }
             }
             else
-                published = _overlay.Update(MonoGameInterop.GetTexturePointer(_canvasTarget));
+            {
+                published = _overlay.Update(MonoGameInterop.GetTexturePointer(canvas!));
+                if (published) PublishedPixels += (long)CanvasWidth * CanvasHeight;
+            }
             _mgr.Heartbeat();
             if (published)
             {
@@ -2714,7 +2750,8 @@ namespace MonoXR.Client
                 if (_mgr.LayerAttached && ++_publishFailStreak >= 90)
                 {
                     _publishFailStreak = 0;
-                    if (_appliedTriple) { DisposeTriple(); ApplyPose(); }
+                    if (_perWindowActive) DisposeWindowOverlays(); // rebuilt by the next UpdateWindowPoses
+                    else if (_appliedTriple) { DisposeTriple(); ApplyPose(); }
                     else RecreateOverlay();
                 }
             }
@@ -2797,7 +2834,7 @@ namespace MonoXR.Client
                 _compositor.Begin(SpriteSortMode.Deferred, BlendState.AlphaBlend, SamplerState.PointClamp);
 
                 int t = Math.Max(1, EditBorderThickness);
-                int w = _canvasTarget.Width, h = _canvasTarget.Height;
+                int w = _canvasW, h = _canvasH;
 
                 // A red frame around every screen as it is seen in VR: the whole
                 // canvas when there is one screen, otherwise each of the three
@@ -2925,6 +2962,18 @@ namespace MonoXR.Client
                 return;
             }
 
+            // A window moved away from its canvas place carries the cursor with it.
+            if (_perWindowActive && TryPlaceCursorOnWindow(out Vector3 winPos, out Quaternion winRot))
+            {
+                _cursorOverlay.Rotation = winRot;
+                _cursorOverlay.Position = winPos;
+                if (_cursorPublished)
+                    _cursorOverlay.UpdatePose();
+                else
+                    _cursorPublished = _cursorOverlay.Update(MonoGameInterop.GetTexturePointer(_cursorTexture));
+                return;
+            }
+
             // Quad-local: centered, +X right, +Y up, in meters.
             float u = (_cursorX + 0.5f) / CanvasWidth, v = (_cursorY + 0.5f) / CanvasHeight;
             var local = new Vector3((u - 0.5f) * canvas.Size.X, (0.5f - v) * canvas.Size.Y, 0f);
@@ -2978,7 +3027,7 @@ namespace MonoXR.Client
         {
             _compositor.Begin(SpriteSortMode.Deferred, BlendState.AlphaBlend, SamplerState.PointClamp);
 
-            int w = _canvasTarget.Width, h = _canvasTarget.Height;
+            int w = _canvasW, h = _canvasH;
             int t = Math.Max(1, EditBorderThickness);
             _compositor.Draw(_whitePixel, new XnaRectangle(0, 0, w, t), XnaColor.Lime);
             _compositor.Draw(_whitePixel, new XnaRectangle(0, h - t, w, t), XnaColor.Lime);
@@ -3247,8 +3296,17 @@ namespace MonoXR.Client
         /// <summary>Replace the overlay with an identical one backed by a new shared texture.</summary>
         private void RecreateOverlay()
         {
+            ReplaceCanvasOverlay(CanvasWidth, CanvasHeight);
+            _canvasDirty = true;
+        }
+
+        // Swap the canvas overlay for one with a shared texture of the given size,
+        // keeping its pose. The new one is made before the old one goes, so the
+        // layer never sees the slot empty.
+        private void ReplaceCanvasOverlay(int width, int height)
+        {
             var old = _overlay;
-            var fresh = _mgr.CreateOverlay(CanvasWidth, CanvasHeight);
+            var fresh = _mgr.CreateOverlay(width, height);
             fresh.Space = old.Space;
             fresh.Position = old.Position;
             fresh.Rotation = old.Rotation;
@@ -3258,7 +3316,461 @@ namespace MonoXR.Client
             fresh.Visible = old.Visible;
             old.Dispose();
             _overlay = fresh;
+        }
+
+        // =====================================================================
+        // One overlay per window
+        //
+        // Instead of composing every panel onto one canvas and publishing the
+        // canvas, each visible panel gets an overlay of its own, sized to the panel
+        // and placed where the panel sits on the canvas. What that saves:
+        //   - no memory for the empty canvas between panels (the canvas target and
+        //     the canvas overlay's shared texture are released),
+        //   - a panel that did not change is not copied at all, and one that did
+        //     copies only its own pixels,
+        //   - each panel can be moved in depth and turned on its own
+        //     (OverlayRenderTarget.DistanceOffset / YawDegrees / ...).
+        // It costs one OpenXR layer per panel, and the pointer, edit mode, the
+        // calibration screen and triple screens still work on the canvas: while any
+        // of those is up the host goes back to the single canvas overlay.
+        // =====================================================================
+
+        private bool _perWindowRequested;
+        private bool _perWindowActive;
+        private readonly HashSet<OverlayRenderTarget> _renderedThisFrame = new();
+        private readonly Dictionary<OverlayRenderTarget, WindowOverlay> _windows = new();
+        private RenderTarget2D? _windowScratch;       // pixels of a scaled / faded panel, on their way to its overlay
+        private Overlay? _toggleOverlay;              // the edit-toggle icon, as a quad of its own
+        private RenderTarget2D? _toggleTexture;
+        private bool _toggleDrawn;
+        private TimeSpan _previewTouched = TimeSpan.MinValue;
+
+        // The canvas overlay is shrunk to this while one overlay per window is on.
+        private const int CanvasStubSize = 16;
+
+        // Slots left for panels: the layer has MaxOverlays, the cursor, the edit
+        // toggle and the canvas stub take one each.
+        private static readonly int MaxWindowOverlays = MonoXrConstants.MaxOverlays - 3;
+
+        private sealed class WindowOverlay
+        {
+            public Overlay Ov = null!;
+            public bool NeedsPublish = true;
+            public bool Moved;          // placed away from its canvas position
+            public Vector3 Position;
+            public Quaternion Rotation;
+            public Vector2 SizeMeters;
+        }
+
+        /// <summary>
+        /// Give every visible window its own OpenXR overlay instead of publishing one
+        /// canvas. Falls back to the canvas while edit mode, mouse calibration or the
+        /// triple layout is up, or when there are more visible windows than overlay
+        /// slots (<see cref="PerWindowAvailable"/> says why).
+        /// </summary>
+        public bool PerWindowOverlays
+        {
+            get => _perWindowRequested;
+            set { if (_perWindowRequested == value) return; _perWindowRequested = value; _canvasDirty = true; }
+        }
+
+        /// <summary>True while the windows really are published one overlay each (the option is on and nothing forces the canvas).</summary>
+        public bool PerWindowActive => _perWindowActive;
+
+        /// <summary>Why one overlay per window cannot be used right now, or null when it can.</summary>
+        public string? PerWindowUnavailableReason
+        {
+            get
+            {
+                if (_triple) return "the triple-screen layout is on";
+                if (EditMode) return "edit mode is on";
+                if (_calStep != 0) return "the mouse calibration is running";
+                int n = 0;
+                foreach (var rt in _targets) if (rt.Visible && !rt.IsSkipped(false)) n++;
+                if (n > MaxWindowOverlays) return $"{n} windows are visible and only {MaxWindowOverlays} overlays are available";
+                return null;
+            }
+        }
+
+        /// <summary>Frames that got past the dirty check (rendered and published), for measuring.</summary>
+        public long FramesProcessed { get; private set; }
+
+        /// <summary>Pixels copied into overlays so far (a canvas publish counts the whole canvas, a window publish just that window).</summary>
+        public long PublishedPixels { get; private set; }
+
+        /// <summary>OpenXR overlays this host holds right now (the cursor and edit-toggle quads included).</summary>
+        public int ActiveOverlayCount
+        {
+            get
+            {
+                // The cursor quad, the edit-toggle quad, and whatever carries the panels
+                // (the canvas overlay's stub in per-window mode is never shown: not counted).
+                int n = 1 + (_toggleOverlay != null ? 1 : 0);
+                if (_perWindowActive) return n + _windows.Count;
+                return n + (_tripleOverlays?.Length ?? 1);
+            }
+        }
+
+        /// <summary>Process id of the VR app the layer is running in, or 0.</summary>
+        public uint LayerProcessId => _mgr.LayerProcessId;
+
+        /// <summary>The windows that exist, in drawing order.</summary>
+        public IReadOnlyList<OverlayRenderTarget> RenderTargets => _targets;
+
+        /// <summary>
+        /// Bytes of GPU memory this process holds for the overlay: the shared texture of
+        /// every overlay plus the canvas target and scratch targets. (The layer's own
+        /// swapchain copies live in the VR app's process and are not included.)
+        /// </summary>
+        public long OverlayGpuBytes
+        {
+            get
+            {
+                long b = 0;
+                void Add(Overlay? o) { if (o != null) b += (long)o.Width * o.Height * 4; }
+                Add(_overlay);
+                Add(_cursorOverlay);
+                Add(_toggleOverlay);
+                foreach (var w in _windows.Values) Add(w.Ov);
+                if (_tripleOverlays != null) foreach (var o in _tripleOverlays) Add(o);
+                if (_canvasTarget != null) b += (long)_canvasTarget.Width * _canvasTarget.Height * 4;
+                if (_windowScratch != null) b += (long)_windowScratch.Width * _windowScratch.Height * 4;
+                return b;
+            }
+        }
+
+        /// <summary>True while a desktop preview is asking for the canvas (it keeps the canvas composed in every mode).</summary>
+        public bool PreviewActive => PreviewWanted;
+
+        private bool PreviewWanted =>
+            _previewTouched != TimeSpan.MinValue && _inputClock.Elapsed - _previewTouched < TimeSpan.FromSeconds(1.5);
+
+        // A desktop preview asked for the canvas: make sure there is one to show.
+        private RenderTarget2D TouchPreview()
+        {
+            _previewTouched = _inputClock.Elapsed;
+            return EnsureCanvasTarget();
+        }
+
+        private RenderTarget2D EnsureCanvasTarget()
+        {
+            if (_canvasTarget == null)
+            {
+                _canvasTarget = new RenderTarget2D(GraphicsDevice, _canvasW, _canvasH);
+                _canvasDirty = true;
+            }
+            return _canvasTarget;
+        }
+
+        // Switch between the canvas overlay and the per-window overlays when what
+        // the host needs changes. Runs every RenderFrame call.
+        private void UpdateRenderMode()
+        {
+            // A desktop preview that was closed leaves the canvas behind: let it go.
+            if (_perWindowActive && _canvasTarget != null && !PreviewWanted)
+            {
+                _canvasTarget.Dispose();
+                _canvasTarget = null;
+                _previewTarget?.Dispose();
+                _previewTarget = null;
+                _previewVersion = -1;
+            }
+
+            bool want = _perWindowRequested && PerWindowUnavailableReason == null;
+            if (want == _perWindowActive) return;
+            _perWindowActive = want;
             _canvasDirty = true;
+
+            if (want)
+            {
+                // The canvas overlay shrinks to a stub that is never shown, so its
+                // shared texture and the canvas target stop costing memory.
+                ReplaceCanvasOverlay(CanvasStubSize, CanvasStubSize);
+                if (!PreviewWanted)
+                {
+                    _canvasTarget?.Dispose();
+                    _canvasTarget = null;
+                }
+            }
+            else
+            {
+                DisposeWindowOverlays();
+                DisposeToggleOverlay();
+                _windowScratch?.Dispose();
+                _windowScratch = null;
+                ReplaceCanvasOverlay(CanvasWidth, CanvasHeight);
+                EnsureCanvasTarget();
+                _editToggleShown = false;
+            }
+        }
+
+        private void DisposeWindowOverlays()
+        {
+            foreach (var w in _windows.Values) w.Ov.Dispose();
+            _windows.Clear();
+        }
+
+        private void DisposeToggleOverlay()
+        {
+            _toggleOverlay?.Dispose();
+            _toggleOverlay = null;
+            _toggleTexture?.Dispose();
+            _toggleTexture = null;
+        }
+
+        // Create, resize and drop window overlays to match the panels, and write
+        // each one's pose. Cheap enough to run on every RenderFrame call: it never
+        // touches the GPU, the pose is just shared memory the layer reads.
+        private void UpdateWindowPoses()
+        {
+            Vector2 size = _overlay.Size;
+            int cw = CanvasWidth, ch = CanvasHeight;
+            if (!(size.X > 0f) || !(size.Y > 0f) || cw <= 0 || ch <= 0) return;
+
+            var frame = Quaternion.CreateFromYawPitchRoll(OriginYaw, OriginPitch, 0f);
+            float mpx = size.X / cw, mpy = size.Y / ch; // meters per canvas pixel
+            bool curved = _appliedCurved;
+            float radius = CurveRadius;
+
+            for (int i = 0; i < _targets.Count; i++)
+            {
+                var rt = _targets[i];
+                if (!rt.Visible || rt.IsSkipped(false))
+                {
+                    if (_windows.Remove(rt, out var gone)) gone.Ov.Dispose();
+                    continue;
+                }
+
+                int dw = rt.DisplayWidth, dh = rt.DisplayHeight;
+                if (!_windows.TryGetValue(rt, out var w) || w.Ov.Width != dw || w.Ov.Height != dh)
+                {
+                    if (w != null) w.Ov.Dispose();
+                    Overlay ov;
+                    try { ov = _mgr.CreateOverlay(dw, dh); }
+                    catch (InvalidOperationException) { _windows.Remove(rt); continue; } // out of slots: this window stays unshown
+                    w = new WindowOverlay { Ov = ov };
+                    _windows[rt] = w;
+                    _canvasDirty = true;
+                }
+
+                // Where the canvas puts the window's centre, in the view origin's frame.
+                float lx = (rt.X + dw / 2f) * mpx - size.X / 2f + _offsetX;
+                float ly = size.Y / 2f - (rt.Y + dh / 2f) * mpy + _offsetY;
+                Vector3 basePos;
+                Quaternion baseRot;
+                if (curved)
+                {
+                    float a = lx / radius;
+                    baseRot = Quaternion.CreateFromAxisAngle(Vector3.UnitY, -a);
+                    basePos = new Vector3(radius * MathF.Sin(a), ly, radius - _distance - radius * MathF.Cos(a));
+                }
+                else
+                {
+                    baseRot = Quaternion.Identity;
+                    basePos = new Vector3(lx, ly, -_distance);
+                }
+
+                float wm = dw * mpx, hm = dh * mpy;
+                Vector3 pos;
+                Quaternion rot;
+                float curve;
+                w.Moved = rt.HasPlacementOverride;
+                if (!w.Moved)
+                {
+                    pos = basePos;
+                    rot = baseRot;
+                    curve = curved ? radius : 0f;
+                }
+                else
+                {
+                    // Slide along the line from the origin, and scale with the
+                    // distance so the window looks the same size from the origin.
+                    float len = basePos.Length();
+                    float newLen = MathF.Max(0.1f, len + rt.DistanceOffset);
+                    float k = len > 1e-4f ? newLen / len : 1f;
+                    pos = basePos * k;
+                    wm *= k;
+                    hm *= k;
+                    const float rad = MathF.PI / 180f;
+                    rot = baseRot * Quaternion.CreateFromYawPitchRoll(rt.YawDegrees * rad, rt.PitchDegrees * rad, rt.RollDegrees * rad);
+                    curve = 0f; // a window that was turned by hand is a flat quad
+                }
+
+                w.Position = OriginPosition + Vector3.Transform(pos, frame);
+                w.Rotation = frame * rot;
+                w.SizeMeters = new Vector2(wm, hm);
+
+                var o = w.Ov;
+                o.Space = _overlay.Space;
+                o.Position = w.Position;
+                o.Rotation = w.Rotation;
+                o.Size = w.SizeMeters;
+                o.CurveRadius = curve;
+                o.ZOrder = i;
+                o.Visible = true;
+                // Not before the first frame is in: the slot would show an empty texture.
+                if (!w.NeedsPublish) o.UpdatePose();
+            }
+        }
+
+        // Copy the windows that changed into their overlays. True when nothing is left to retry.
+        private bool PublishWindows(bool all)
+        {
+            bool done = true;
+            foreach (var rt in _targets)
+            {
+                if (!_windows.TryGetValue(rt, out var w)) continue;
+                if (!all && !w.NeedsPublish && !_renderedThisFrame.Contains(rt)) continue;
+                w.NeedsPublish = !PublishWindow(rt, w);
+                done &= !w.NeedsPublish;
+            }
+            return done;
+        }
+
+        private bool PublishWindow(OverlayRenderTarget rt, WindowOverlay w)
+        {
+            var ov = w.Ov;
+            int dw = ov.Width, dh = ov.Height;
+
+            // A panel at its own size and full opacity is copied straight from its target.
+            bool ok;
+            if (rt.Width == dw && rt.Height == dh && rt.SourceWidth == dw && rt.SourceHeight == dh && rt.Opacity >= 0.999f)
+                ok = ov.Update(MonoGameInterop.GetTexturePointer(rt.Target));
+            else
+            {
+                // Scaled, collapsed or faded: draw it as the canvas would have, then copy that.
+                var scratch = EnsureWindowScratch(dw, dh);
+                GraphicsDevice.SetRenderTarget(scratch);
+                GraphicsDevice.Clear(XnaColor.Transparent);
+                _compositor.Begin(SpriteSortMode.Deferred, BlendState.AlphaBlend, SamplerState.LinearClamp);
+                _compositor.Draw(rt.Target, new XnaRectangle(0, 0, dw, dh),
+                    new XnaRectangle(0, 0, rt.SourceWidth, rt.SourceHeight), XnaColor.White * rt.Opacity);
+                _compositor.End();
+                GraphicsDevice.SetRenderTarget(null);
+                ok = ov.Update(MonoGameInterop.GetTexturePointer(scratch), 0, 0);
+            }
+            if (ok) PublishedPixels += (long)dw * dh;
+            return ok;
+        }
+
+        private RenderTarget2D EnsureWindowScratch(int w, int h)
+        {
+            if (_windowScratch == null || _windowScratch.Width < w || _windowScratch.Height < h)
+            {
+                int nw = Math.Max(w, _windowScratch?.Width ?? 0), nh = Math.Max(h, _windowScratch?.Height ?? 0);
+                _windowScratch?.Dispose();
+                _windowScratch = new RenderTarget2D(GraphicsDevice, nw, nh);
+            }
+            return _windowScratch;
+        }
+
+        // The edit-toggle icon is drawn on the canvas, which one overlay per window
+        // does not keep: show it as a small quad on the canvas plane instead.
+        private void UpdateToggleOverlay()
+        {
+            bool show = _perWindowActive && _calStep == 0 && EditToggleVisible;
+            if (_perWindowActive) _editToggleShown = EditToggleVisible; // nothing to recompose for it
+
+            if (!show)
+            {
+                if (_toggleOverlay is { Visible: true } hidden)
+                {
+                    hidden.Visible = false;
+                    if (_toggleDrawn) hidden.UpdatePose();
+                }
+                return;
+            }
+
+            var rect = GetEditToggleRect();
+            int px = Math.Max(1, rect.Width);
+            if (_toggleOverlay == null || _toggleOverlay.Width != px)
+            {
+                DisposeToggleOverlay();
+                _toggleTexture = new RenderTarget2D(GraphicsDevice, px, px);
+                GraphicsDevice.SetRenderTarget(_toggleTexture);
+                GraphicsDevice.Clear(XnaColor.Transparent);
+                _compositor.Begin(SpriteSortMode.Deferred, BlendState.AlphaBlend, SamplerState.LinearClamp);
+                DrawEditToggle(new XnaRectangle(0, 0, px, px), false);
+                _compositor.End();
+                GraphicsDevice.SetRenderTarget(null);
+                try { _toggleOverlay = _mgr.CreateOverlay(px, px, topmost: true); }
+                catch (InvalidOperationException) { DisposeToggleOverlay(); return; }
+                _toggleDrawn = false;
+            }
+            // The first copy can lose the race for the shared texture: retry until it lands.
+            if (!_toggleDrawn)
+                _toggleDrawn = _toggleOverlay.Update(MonoGameInterop.GetTexturePointer(_toggleTexture!));
+
+            var canvas = _overlay;
+            float mpx = canvas.Size.X / Math.Max(1, CanvasWidth);
+            _toggleOverlay.Space = canvas.Space;
+            _toggleOverlay.Size = new Vector2(px * mpx, px * mpx);
+            _toggleOverlay.CurveRadius = 0f;
+            _toggleOverlay.Visible = true;
+
+            // Centre of the icon on the canvas plane (flat, or following the cylinder).
+            float u = (rect.X + px / 2f) / CanvasWidth, v = (rect.Y + px / 2f) / CanvasHeight;
+            var local = new Vector3((u - 0.5f) * canvas.Size.X, (0.5f - v) * canvas.Size.Y, 0f);
+            _toggleOverlay.Rotation = canvas.Rotation;
+            if (_appliedCurved)
+            {
+                float radius = CurveRadius, phi = local.X / radius;
+                local = new Vector3(radius * MathF.Sin(phi), local.Y, radius * (1f - MathF.Cos(phi)));
+                _toggleOverlay.Rotation = canvas.Rotation * Quaternion.CreateFromAxisAngle(Vector3.UnitY, -phi);
+            }
+            _toggleOverlay.Position = canvas.Position + Vector3.Transform(local, canvas.Rotation);
+            if (_toggleDrawn) _toggleOverlay.UpdatePose();
+        }
+
+        // Cursor on the topmost moved window under the canvas cursor position.
+        private bool TryPlaceCursorOnWindow(out Vector3 position, out Quaternion rotation)
+        {
+            position = default;
+            rotation = default;
+            float cx = _cursorX + 0.5f, cy = _cursorY + 0.5f;
+            for (int i = _targets.Count - 1; i >= 0; i--)
+            {
+                var rt = _targets[i];
+                if (!_windows.TryGetValue(rt, out var w) || !w.Moved) continue;
+                int dw = rt.DisplayWidth, dh = rt.DisplayHeight;
+                if (cx < rt.X || cy < rt.Y || cx >= rt.X + dw || cy >= rt.Y + dh) continue;
+                var local = new Vector3(((cx - rt.X) / dw - 0.5f) * w.SizeMeters.X, (0.5f - (cy - rt.Y) / dh) * w.SizeMeters.Y, 0f);
+                position = w.Position + Vector3.Transform(local, w.Rotation);
+                rotation = w.Rotation;
+                return true;
+            }
+            return false;
+        }
+
+        // The nearest moved window a line of sight lands in, as a canvas point (so
+        // gaze focus and pointing keep working on a window that is not where the
+        // canvas puts it). Windows that were not moved are left to the canvas maths.
+        private bool RayHitsMovedWindow(Vector3 eye, Quaternion head, out float x, out float y)
+        {
+            x = y = 0f;
+            Vector3 look = Vector3.Transform(-Vector3.UnitZ, head);
+            float lookLen = look.Length();
+            if (!(lookLen > 1e-4f)) return false;
+            look /= lookLen;
+
+            float best = float.MaxValue;
+            foreach (var rt in _targets)
+            {
+                if (!_windows.TryGetValue(rt, out var w) || !w.Moved) continue;
+                Vector3 normal = Vector3.Transform(Vector3.UnitZ, w.Rotation);
+                float denom = Vector3.Dot(look, normal);
+                if (MathF.Abs(denom) < 1e-4f) continue;
+                float t = Vector3.Dot(w.Position - eye, normal) / denom;
+                if (t <= 0f || t >= best) continue;
+                Vector3 hit = eye + look * t - w.Position;
+                float lx = Vector3.Dot(hit, Vector3.Transform(Vector3.UnitX, w.Rotation));
+                float ly = Vector3.Dot(hit, Vector3.Transform(Vector3.UnitY, w.Rotation));
+                if (MathF.Abs(lx) > w.SizeMeters.X / 2f || MathF.Abs(ly) > w.SizeMeters.Y / 2f) continue;
+                best = t;
+                x = rt.X + (lx / w.SizeMeters.X + 0.5f) * rt.DisplayWidth;
+                y = rt.Y + (0.5f - ly / w.SizeMeters.Y) * rt.DisplayHeight;
+            }
+            return best < float.MaxValue && float.IsFinite(x) && float.IsFinite(y);
         }
 
         public void Dispose()
@@ -3270,7 +3782,10 @@ namespace MonoXR.Client
             _whitePixel.Dispose();
             _compositor.Dispose();
             _previewTarget?.Dispose();
-            _canvasTarget.Dispose();
+            _canvasTarget?.Dispose();
+            _windowScratch?.Dispose();
+            DisposeWindowOverlays();
+            DisposeToggleOverlay();
             _cursorOverlay.Dispose();
             _cursorTexture.Dispose();
             DisposeTriple();

@@ -707,10 +707,24 @@ static XrResult XRAPI_CALL MonoXr_xrEndFrame(XrSession session, const XrFrameEnd
         MonoXrOverlaySlot slot = s.control->slots[i]; // copy snapshot
         SlotResources& r = s.slots[i];
 
-        if (!slot.active || !slot.visible) {
-            if (r.swapchain != XR_NULL_HANDLE) { /* keep for reuse */ }
+        if (!slot.active) {
+            // The client let go of this slot (disposed the overlay, e.g. when it
+            // switched from one canvas to one overlay per window): give back the
+            // swapchain and the shared texture we opened. Without this the
+            // game's process would keep the old overlay's GPU memory until
+            // something else happened to reuse the slot.
+            if (r.swapchain != XR_NULL_HANDLE) {
+                down_xrDestroySwapchain(r.swapchain);
+                r.swapchain = XR_NULL_HANDLE;
+                r.images.clear();
+                r.width = r.height = r.format = 0;
+                r.lastFrameIndex = ~0ull;
+                r.hasContent = false;
+            }
+            r.releaseShared();
             continue;
         }
+        if (!slot.visible) continue; // hidden but still owned: keep the swapchain for when it comes back
         if (slot.texWidth == 0 || slot.texHeight == 0) continue;
 
         XrSwapchainSubImage sub{};

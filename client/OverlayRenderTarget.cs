@@ -211,6 +211,31 @@ namespace MonoXR.Client
             }
         }
 
+        // ---- Placement in 3D (only used while MonoGameOverlayHost.PerWindowOverlays is on) ----
+        // Each window then is its own OpenXR overlay, and these move it away from where
+        // its canvas position puts it. They never touch the canvas layout, so the
+        // pointer (which works in canvas pixels) keeps hitting the window.
+
+        /// <summary>
+        /// Meters to push this window away from (positive) or toward (negative) the
+        /// viewer, along the line from the view origin to the window. Its apparent
+        /// size stays the same, so it grows and shrinks in the world as it moves.
+        /// </summary>
+        public float DistanceOffset { get; set; }
+
+        /// <summary>Turn about the window's own vertical axis, degrees (positive turns it toward +X).</summary>
+        public float YawDegrees { get; set; }
+
+        /// <summary>Tilt about the window's own horizontal axis, degrees (positive tips the top toward the viewer).</summary>
+        public float PitchDegrees { get; set; }
+
+        /// <summary>Spin about the window's own normal, degrees.</summary>
+        public float RollDegrees { get; set; }
+
+        /// <summary>True when any of the 3D placement values differs from "where the canvas puts it".</summary>
+        public bool HasPlacementOverride =>
+            DistanceOffset != 0f || YawDegrees != 0f || PitchDegrees != 0f || RollDegrees != 0f;
+
         /// <summary>Size currently occupied on the canvas: the source region times <see cref="Scale"/>.</summary>
         public int DisplayWidth => Math.Max(1, (int)MathF.Round(SourceWidth * _scale));
         public int DisplayHeight => Math.Max(1, (int)MathF.Round(SourceHeight * _scale));
