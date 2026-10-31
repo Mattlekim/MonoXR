@@ -1413,7 +1413,7 @@ namespace MonoXR.Client
         /// (clamped — the game's own cursor stops at its window edge too).
         /// False when no game window is available.
         /// </summary>
-        private bool TryGetGameCursor(out float u, out float v)
+        private bool TryGetGameCursor(out float u, out float v, bool trackOvershoot = false)
         {
             u = v = 0f;
             IntPtr hWnd = FindGameWindow();
@@ -1421,22 +1421,41 @@ namespace MonoXR.Client
             if (!GetClientRect(hWnd, out var rc) || !ScreenToClient(hWnd, ref p)) return false;
             int w = rc.Right - rc.Left, h = rc.Bottom - rc.Top;
             if (w <= 1 || h <= 1) return false; // minimized
+            if (trackOvershoot)
+            {
+                // The real cursor can leave the game window; keep how far it went and take that off
+                // on the way back, so it moves again the moment it turns round.
+                u = SlackClamp(p.X, 0f, w - 1f, ref _windowSlackX) / (w - 1);
+                v = SlackClamp(p.Y, 0f, h - 1f, ref _windowSlackY) / (h - 1);
+                return true;
+            }
             u = Math.Clamp(p.X / (float)(w - 1), 0f, 1f);
             v = Math.Clamp(p.Y / (float)(h - 1), 0f, 1f);
             return true;
         }
 
-        // How far the game cursor is past the canvas edge it is pushing against, in canvas pixels.
+        // How far the pointer is past a limit it is pushing against. Each limit keeps its own: the game
+        // window's edge, the canvas edge, a controller pointer's canvas edge and a top / bottom screen's
+        // side. The distance is taken off again as the pointer comes back, so it never has to travel
+        // back over ground it only reached by overshooting.
+        private float _windowSlackX, _windowSlackY;
         private float _edgeSlackX, _edgeSlackY;
+        private float _overrideSlackX, _overrideSlackY;
+        private float _bandSlackX;
 
-        private static int SlackClamp(float mapped, int size, ref float slack)
+        private void ResetOvershoot() =>
+            _windowSlackX = _windowSlackY = _edgeSlackX = _edgeSlackY = _overrideSlackX = _overrideSlackY = _bandSlackX = 0f;
+
+        private static float SlackClamp(float mapped, float min, float max, ref float slack)
         {
             float pos = mapped + slack;
-            float max = size - 1;
             if (pos > max) { slack -= pos - max; pos = max; }
-            else if (pos < 0f) { slack -= pos; pos = 0f; }
-            return (int)pos;
+            else if (pos < min) { slack += min - pos; pos = min; }
+            return pos;
         }
+
+        private static int SlackClamp(float mapped, int size, ref float slack) =>
+            (int)SlackClamp(mapped, 0f, size - 1f, ref slack);
 
         // Calibration: canvas fraction = scale * game-window fraction + offset,
         // per axis. Identity (1, 0) = the game window maps onto the whole canvas.
@@ -1453,7 +1472,7 @@ namespace MonoXR.Client
         public void SetCursorCalibration(float scaleX, float offsetX, float scaleY, float offsetY)
         {
             if (!float.IsFinite(scaleX + offsetX + scaleY + offsetY) || scaleX == 0f || scaleY == 0f) return;
-            _edgeSlackX = _edgeSlackY = 0f;
+            ResetOvershoot();
             _calScaleX = scaleX; _calOffsetX = offsetX;
             _calScaleY = scaleY; _calOffsetY = offsetY;
             CursorCalibrated = true;
@@ -1463,7 +1482,7 @@ namespace MonoXR.Client
         /// <summary>Forget the calibration: the game window maps onto the whole canvas again.</summary>
         public void ResetCursorCalibration()
         {
-            _edgeSlackX = _edgeSlackY = 0f;
+            ResetOvershoot();
             _calScaleX = _calScaleY = 1f;
             _calOffsetX = _calOffsetY = 0f;
             CursorCalibrated = false;
@@ -1556,10 +1575,10 @@ namespace MonoXR.Client
             int mx, my;
             if (CursorOverride?.Invoke() is { } over)
             {
-                mx = Math.Clamp(over.X, 0, CanvasWidth - 1);
-                my = Math.Clamp(over.Y, 0, CanvasHeight - 1);
+                mx = SlackClamp(over.X, CanvasWidth, ref _overrideSlackX);
+                my = SlackClamp(over.Y, CanvasHeight, ref _overrideSlackY);
             }
-            else if (TryGetGameCursor(out float gu, out float gv))
+            else if (TryGetGameCursor(out float gu, out float gv, trackOvershoot: true))
             {
                 // Game attached: its window (not the monitor) is what the game
                 // maps onto its in-VR cursor; the calibration fits that to the canvas.
@@ -1581,15 +1600,18 @@ namespace MonoXR.Client
 
             // On the top or bottom screen the pointer stays between that screen's
             // left and right edges; it cannot slide off onto columns it doesn't show.
+            bool inBand = false;
             if (_appliedTriple)
             {
                 BandsPx(out int topPx, out int botPx);
                 if (topPx > 0 && my < topPx || botPx > 0 && my >= CanvasHeight - botPx)
                 {
                     var c = TripleLayout()[1];
-                    mx = Math.Clamp(mx, c.X0, c.X0 + c.Px - 1);
+                    mx = (int)SlackClamp(mx, c.X0, c.X0 + c.Px - 1, ref _bandSlackX);
+                    inBand = true;
                 }
             }
+            if (!inBand) _bandSlackX = 0f;
 
             if (mx != _cursorX || my != _cursorY)
             {
