@@ -71,10 +71,7 @@ namespace MonoXR.Client
         // follows the pointer. Uses the bar geometry from the last Draw.
         public override bool OnPointerPress(int x, int y)
         {
-            if (!IsEnabled || _track.Width <= 0) return false;
-            var hit = _track;
-            hit.Inflate(14, Math.Max(18, (Bounds.Height - _track.Height) / 2));
-            if (!hit.Contains(x, y)) return false;
+            if (!IsEnabled || !OverBar(x, y)) return false;
             _dragging = true;
             SetFromPointer(x);
             return true;
@@ -85,13 +82,23 @@ namespace MonoXR.Client
             if (_dragging) SetFromPointer(x);
         }
 
-        // Anywhere on the row keeps the wheel (even a disabled one, so the turn does not fall through to
+        // The bar and a little around it, as last drawn: where a press grabs the slider and the wheel turns it.
+        // The name and the readout are not part of it, so the wheel over them scrolls the panel as usual.
+        private bool OverBar(int x, int y)
+        {
+            if (_track.Width <= 0) return false;
+            var hit = _track;
+            hit.Inflate(14, Math.Max(18, (Bounds.Height - _track.Height) / 2));
+            return hit.Contains(x, y);
+        }
+
+        // Only over the bar keeps the wheel (even a disabled slider's, so the turn does not fall through to
         // a scrolling panel behind it); only an enabled slider changes.
-        public override bool WantsWheel(int x, int y) => Bounds.Contains(x, y);
+        public override bool WantsWheel(int x, int y) => OverBar(x, y);
 
         public override bool OnPointerWheel(int x, int y, int delta)
         {
-            if (!IsEnabled || !Bounds.Contains(x, y)) return false;
+            if (!IsEnabled || !OverBar(x, y)) return false;
             int notches = (int)Math.Round(delta / 120.0);
             if (notches == 0) notches = delta > 0 ? 1 : -1;
             float step = Step > 0 ? Step : (Maximum - Minimum) / 100f;

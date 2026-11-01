@@ -204,8 +204,19 @@ namespace MonoXR.Client
         /// <summary>First row of the picture that is shown (below a hidden title bar).</summary>
         public int SourceTop => _titleBarHidden && !IsCollapsed ? Math.Clamp(TitleBarSourceHeight, 0, Math.Max(0, Height - 1)) : 0;
 
-        public const float MinScale = 0.4f;
-        public const float MaxScale = 3f;
+        /// <summary>
+        /// Canvas pixel density relative to the default (1 at 768 px/m). The size limits below follow it, so
+        /// a panel scaled up to keep its physical size when the DPI is raised is not held back by them.
+        /// </summary>
+        public static float ScaleUnit
+        {
+            get => _scaleUnit;
+            set => _scaleUnit = float.IsFinite(value) ? Math.Clamp(value, 0.05f, 50f) : 1f;
+        }
+        private static float _scaleUnit = 1f;
+
+        public static float MinScale => 0.4f * _scaleUnit;
+        public static float MaxScale => 3f * _scaleUnit;
         private float _scale = 1f;
 
         /// <summary>

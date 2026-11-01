@@ -960,6 +960,13 @@ namespace MonoXR.Client
         /// <summary>Once per frame: pass collected wheel turns to the target under the cursor, and tell the hook whether to swallow them.</summary>
         private void ProcessWheel()
         {
+            if (_inputLocked)
+            {
+                // Nothing reacts to the wheel while locked, but it is not let through to the game either.
+                System.Threading.Interlocked.Exchange(ref _wheelAccum, 0);
+                _swallowWheel = false;
+                return;
+            }
             var rt = _pointerCapture ?? HitTest(_cursorX, _cursorY);
             bool wants = rt != null && !_disposed
                          && rt.WantsPointerWheel(ToLocalX(rt, _cursorX), ToLocalY(rt, _cursorY));
@@ -967,7 +974,13 @@ namespace MonoXR.Client
 
             int delta = System.Threading.Interlocked.Exchange(ref _wheelAccum, 0);
             if (delta == 0 || !wants || rt == null) return;
-            if (rt.OnPointerWheel(ToLocalX(rt, _cursorX), ToLocalY(rt, _cursorY), delta)) _canvasDirty = true;
+            if (rt.OnPointerWheel(ToLocalX(rt, _cursorX), ToLocalY(rt, _cursorY), delta))
+            {
+                // The panel's own picture is what changed (the list scrolled, a slider moved): it has to be
+                // redrawn, not just the canvas put together again, or the change only shows on the next click.
+                rt.Invalidate();
+                _canvasDirty = true;
+            }
         }
 
         private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
@@ -1514,6 +1527,11 @@ namespace MonoXR.Client
         private float _overrideSlackX, _overrideSlackY;
         private float _bandSlackX;
 
+        // The canvas-edge limits' overshoot is measured in canvas pixels, so it means nothing once the canvas
+        // has a different size (the game window's own overshoot is in its pixels and is left alone).
+        private void ResetCanvasOvershoot() =>
+            _edgeSlackX = _edgeSlackY = _overrideSlackX = _overrideSlackY = _bandSlackX = 0f;
+
         private void ResetOvershoot() =>
             _windowSlackX = _windowSlackY = _edgeSlackX = _edgeSlackY = _overrideSlackX = _overrideSlackY = _bandSlackX = 0f;
 
@@ -1695,8 +1713,110 @@ namespace MonoXR.Client
             return true;
         }
 
+        // ----- Input lock --------------------------------------------------------
+        // While the app waits for the user to press something to bind (a wheel button...), nothing on the
+        // canvas may react to the mouse, and everything is veiled so it is plain that only the bind is live.
+
+        private bool _inputLocked;
+        private string _inputLockMessage = "";
+        private bool _lockRmbWasDown;
+
+        /// <summary>
+        /// True: every panel, button and slider ignores the pointer and the wheel, and a translucent grey veil
+        /// covers the canvas. A click anywhere raises <see cref="LockedClick"/> instead.
+        /// </summary>
+        public bool InputLocked
+        {
+            get => _inputLocked;
+            set
+            {
+                if (_inputLocked == value) return;
+                _inputLocked = value;
+                if (value)
+                {
+                    // Whatever the pointer was doing is over; the press that opened the lock must not count again.
+                    SetHover(null, 0, 0);
+                    SetEditHover(null, 0, 0);
+                    _showMenuOpen = false;
+                    _ctxOpen = false;
+                    _lockRmbWasDown = PollRightButton();
+                }
+                _canvasDirty = true;
+                PreviewVersion++;
+            }
+        }
+
+        /// <summary>Shown in the middle of the veil while <see cref="InputLocked"/> is on.</summary>
+        public string InputLockMessage
+        {
+            get => _inputLockMessage;
+            set { if (_inputLockMessage == value) return; _inputLockMessage = value; if (_inputLocked) _canvasDirty = true; }
+        }
+
+        /// <summary>A mouse button went down while <see cref="InputLocked"/> was on: true for the right button.</summary>
+        public event Action<bool>? LockedClick;
+
+        private void UpdateLockedInput()
+        {
+            if (_pointerCapture != null || _editCapture != null || _dragTarget != null || _resizeTarget != null)
+            {
+                // A gesture was in progress when the lock came on: drop it where it stands.
+                _pointerCapture?.OnPointerRelease(ToLocalX(_pointerCapture, _cursorX), ToLocalY(_pointerCapture, _cursorY));
+                _pointerCapture = null;
+                if (_editCapture != null) _editCapture.OnEditRelease(ToLocalX(_editCapture, _cursorX), ToLocalY(_editCapture, _cursorY));
+                _editCapture = null;
+                if (_dragTarget != null) DragCompleted?.Invoke(_dragTarget);
+                _dragTarget = null;
+                if (_resizeTarget != null) ScaleChanged?.Invoke(_resizeTarget);
+                _resizeTarget = null;
+                if (_groupDrag) EndGroupDrag();
+                if (_groupResize) EndGroupResize();
+                _marquee = false;
+                _canvasDirty = true;
+            }
+
+            UpdateCursor(); // the crosshair still follows the mouse
+
+            bool lmb = LeftButtonOverride?.Invoke() ?? ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0);
+            bool rmb = PollRightButton();
+            bool leftPress = lmb && !_lmbWasDown, rightPress = rmb && !_lockRmbWasDown;
+            _lmbWasDown = lmb;
+            _lockRmbWasDown = rmb;
+            _rmbWasDown = rmb;
+            _editRmbWasDown = rmb;
+            if (leftPress) LockedClick?.Invoke(false);
+            else if (rightPress) LockedClick?.Invoke(true);
+        }
+
+        /// <summary>The veil and message, drawn last so they cover everything. The compositor must be inside Begin/End.</summary>
+        private void DrawInputLock()
+        {
+            _compositor.Draw(_whitePixel, new XnaRectangle(0, 0, _canvasW, _canvasH), XnaColor.Gray * 0.3f);
+            if (EditFont == null || _inputLockMessage.Length == 0) return;
+
+            // Centred on the middle screen (the whole canvas when there is only one).
+            var area = new XnaRectangle(0, 0, _canvasW, _canvasH);
+            if (_appliedTriple)
+            {
+                var c = TripleLayout()[1];
+                area = new XnaRectangle(c.X0, c.Y0, c.Px, c.Py);
+            }
+            var size = EditFont.MeasureString(_inputLockMessage);
+            float x = area.X + (area.Width - size.X) / 2f, y = area.Y + (area.Height - size.Y) / 2f;
+            var box = new XnaRectangle((int)x - 24, (int)y - 14, (int)size.X + 48, (int)size.Y + 28);
+            MonoXRDraw.RoundedRect(_compositor, box, 12, new XnaColor(20, 20, 32) * 0.92f);
+            MonoXRDraw.RoundedRectOutline(_compositor, box, 12, 2, XnaColor.Yellow);
+            _compositor.DrawString(EditFont, _inputLockMessage, new Vector2(x, y), XnaColor.White);
+        }
+
         private void UpdateEditInput()
         {
+            if (_inputLocked)
+            {
+                UpdateLockedInput();
+                return;
+            }
+
             if (!EditMode)
             {
                 SetEditHover(null, 0, 0);
@@ -2326,10 +2446,14 @@ namespace MonoXR.Client
         // left or right canvas edge, vertically centred, behind a small arrow
         // tab that opens and closes it. The host places and sizes it; it is never
         // selected, dragged, or given the button bar.
-        private const int DockTabWidth = 56;
-        private const int DockTabHeight = 180;
-        private const int DockTabGap = 12;       // between stacked tabs on one edge
-        private const int DockMargin = 16;   // clear space kept around an open panel
+        // The tabs and the panels behind them are drawn at this fraction of their natural size, and follow
+        // the canvas pixel density (OverlayRenderTarget.ScaleUnit) so they keep their physical size.
+        private const float DockSizeFactor = 0.6f;
+        private static float DockUnit => DockSizeFactor * OverlayRenderTarget.ScaleUnit;
+        private static int DockTabWidth => Math.Max(8, (int)MathF.Round(56 * DockUnit));
+        private static int DockTabHeight => Math.Max(16, (int)MathF.Round(180 * DockUnit));
+        private static int DockTabGap => Math.Max(2, (int)MathF.Round(12 * DockUnit));   // between stacked tabs on one edge
+        private static int DockMargin => Math.Max(2, (int)MathF.Round(16 * DockUnit));   // clear space kept around an open panel
 
         private void LayoutDocks()
         {
@@ -2341,7 +2465,7 @@ namespace MonoXR.Client
                 // Shrink a panel that is too big for the canvas so it always fits.
                 // Centred on the screens below the top screen's band, not on the whole canvas.
                 int band = BandPx(), area = CanvasHeight - band - BottomBandPx();
-                float fit = MathF.Min(1f, MathF.Min((area - DockMargin) / (float)rt.Height,
+                float fit = MathF.Min(DockUnit, MathF.Min((area - DockMargin) / (float)rt.Height,
                                                     (CanvasWidth - DockTabWidth - DockMargin) / (float)rt.Width));
                 rt.Scale = Math.Max(OverlayRenderTarget.MinScale, fit);
 
@@ -2420,17 +2544,21 @@ namespace MonoXR.Client
             var r = GetDockTab(rt);
             var bg = rt.DockOpen ? new XnaColor(90, 60, 140) : new XnaColor(40, 40, 60);
             var edge = rt.DockOpen ? XnaColor.MediumPurple : XnaColor.Yellow;
-            MonoXRDraw.RoundedRect(_compositor, r, 14, bg);
-            MonoXRDraw.RoundedRectOutline(_compositor, r, 14, 2, edge);
+            float u = DockUnit;
+            int corner = Math.Max(3, (int)MathF.Round(14 * u)), line = Math.Max(1, (int)MathF.Round(2 * u));
+            MonoXRDraw.RoundedRect(_compositor, r, corner, bg);
+            MonoXRDraw.RoundedRectOutline(_compositor, r, corner, line, edge);
 
             // Arrow toward the canvas centre when closed (pull the panel out), away from it when open.
             bool right = rt.DockSide == OverlayDockSide.Right;
             bool pointsLeft = right != rt.DockOpen;
             int cx = r.X + r.Width / 2, cy = r.Y + r.Height / 2;
-            for (int k = 0; k < 12; k++)
+            int cols = Math.Max(4, (int)MathF.Round(12 * u)); // a wedge of 1 px columns, 12 of them at full size
+            int half = Math.Max(2, (int)MathF.Round(8 * u));
+            for (int k = 0; k < cols; k++)
             {
-                int x = pointsLeft ? cx - 8 + k : cx + 8 - k;
-                int barH = 2 + k * 2;
+                int x = pointsLeft ? cx - half + k : cx + half - k;
+                int barH = Math.Max(2, (int)MathF.Round((2 + k * 2 * 12f / cols) * u));
                 _compositor.Draw(_whitePixel, new XnaRectangle(x, cy - barH / 2, 1, barH), XnaColor.White);
             }
         }
@@ -2748,6 +2876,7 @@ namespace MonoXR.Client
                 _canvasTarget = new RenderTarget2D(GraphicsDevice, width, height);
             }
             foreach (var rt in _targets) rt.Invalidate();
+            ResetCanvasOvershoot();
 
             // (ApplyPose below moves the panels with the centre screen's corner.)
             ApplyPose(); // also rebuilds the triple screens at the new size
@@ -3102,6 +3231,13 @@ namespace MonoXR.Client
             {
                 _compositor.Begin(SpriteSortMode.Deferred, BlendState.AlphaBlend, SamplerState.LinearClamp);
                 DrawEditToggle(GetEditToggleRect(), EditMode);
+                _compositor.End();
+            }
+
+            if (_inputLocked)
+            {
+                _compositor.Begin(SpriteSortMode.Deferred, BlendState.AlphaBlend, SamplerState.LinearClamp);
+                DrawInputLock();
                 _compositor.End();
             }
 
