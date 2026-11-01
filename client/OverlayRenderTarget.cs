@@ -368,6 +368,18 @@ namespace MonoXR.Client
         /// </summary>
         public virtual void OnPointerMove(int x, int y) { }
 
+        /// <summary>
+        /// True while the pointer, at this target-local point, is somewhere the mouse wheel does something
+        /// (a scrollable list). The host then keeps that wheel turn from also reaching the game.
+        /// </summary>
+        public virtual bool WantsPointerWheel(int x, int y) => false;
+
+        /// <summary>
+        /// The mouse wheel turned over this target, in target-local pixels. <paramref name="delta"/> is in
+        /// wheel units: 120 per notch, positive when rolled away from the user (up). Return true when used.
+        /// </summary>
+        public virtual bool OnPointerWheel(int x, int y, int delta) => false;
+
         /// <summary>The pointer left this target (or edit mode began): drop any hover highlight.</summary>
         public virtual void OnPointerExit() { }
 

@@ -907,6 +907,69 @@ namespace MonoXR.Client
         [System.Runtime.InteropServices.DllImport("user32.dll")]
         private static extern int GetSystemMetrics(int nIndex);
 
+        // ----- Mouse wheel ----------------------------------------------------
+        // The wheel has no pollable state, so a low-level mouse hook (global, like the polling above,
+        // so it works while the game has focus) adds up the notches. The hook only collects; the frame
+        // loop hands them to the target under the cursor (ProcessWheel). While that target has something
+        // to scroll, the turn is swallowed so the game does not also zoom / change camera with it.
+        private delegate IntPtr LowLevelMouseProc(int nCode, IntPtr wParam, IntPtr lParam);
+        [System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)]
+        private static extern IntPtr SetWindowsHookEx(int idHook, LowLevelMouseProc lpfn, IntPtr hMod, uint dwThreadId);
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        private static extern bool UnhookWindowsHookEx(IntPtr hhk);
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        private static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
+        [System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+        private static extern IntPtr GetModuleHandle(string? lpModuleName);
+
+        private const int WH_MOUSE_LL = 14;
+        private const int WM_MOUSEWHEEL = 0x020A;
+
+        private IntPtr _mouseHook = IntPtr.Zero;
+        private LowLevelMouseProc? _mouseProc; // kept in a field so it is not collected while hooked
+        private int _wheelAccum;               // wheel units since the last frame (hook thread -> frame loop)
+        private volatile bool _swallowWheel;   // the target under the cursor wants the wheel
+
+        private void InstallWheelHook()
+        {
+            try
+            {
+                _mouseProc = (nCode, wParam, lParam) =>
+                {
+                    if (nCode >= 0 && (int)wParam == WM_MOUSEWHEEL)
+                    {
+                        // MSLLHOOKSTRUCT: POINT pt (8 bytes), then mouseData - the wheel delta is its high word.
+                        int delta = (short)((System.Runtime.InteropServices.Marshal.ReadInt32(lParam, 8) >> 16) & 0xFFFF);
+                        System.Threading.Interlocked.Add(ref _wheelAccum, delta);
+                        if (_swallowWheel) return (IntPtr)1;
+                    }
+                    return CallNextHookEx(_mouseHook, nCode, wParam, lParam);
+                };
+                _mouseHook = SetWindowsHookEx(WH_MOUSE_LL, _mouseProc, GetModuleHandle(null), 0);
+            }
+            catch { _mouseHook = IntPtr.Zero; } // no wheel scrolling, nothing else is affected
+        }
+
+        private void RemoveWheelHook()
+        {
+            _swallowWheel = false;
+            if (_mouseHook != IntPtr.Zero) { UnhookWindowsHookEx(_mouseHook); _mouseHook = IntPtr.Zero; }
+            _mouseProc = null;
+        }
+
+        /// <summary>Once per frame: pass collected wheel turns to the target under the cursor, and tell the hook whether to swallow them.</summary>
+        private void ProcessWheel()
+        {
+            var rt = _pointerCapture ?? HitTest(_cursorX, _cursorY);
+            bool wants = rt != null && !_disposed
+                         && rt.WantsPointerWheel(ToLocalX(rt, _cursorX), ToLocalY(rt, _cursorY));
+            _swallowWheel = wants;
+
+            int delta = System.Threading.Interlocked.Exchange(ref _wheelAccum, 0);
+            if (delta == 0 || !wants || rt == null) return;
+            if (rt.OnPointerWheel(ToLocalX(rt, _cursorX), ToLocalY(rt, _cursorY), delta)) _canvasDirty = true;
+        }
+
         private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
         [System.Runtime.InteropServices.DllImport("user32.dll")]
         private static extern bool EnumWindows(EnumWindowsProc callback, IntPtr lParam);
@@ -2634,6 +2697,7 @@ namespace MonoXR.Client
             _overlay.Space = MonoXrSpace.World;
             _overlay.Size = new Vector2(2.5f, 2.5f);
             _overlay.Visible = true;
+            InstallWheelHook();
             ApplyPose(); // 3m straight ahead of the world origin
 
             _cursorTexture = new RenderTarget2D(GraphicsDevice, CursorTexSize, CursorTexSize);
@@ -2709,6 +2773,7 @@ namespace MonoXR.Client
             // between samples on capped ticks). Changes just mark things
             // dirty; the actual render still happens at the capped rate.
             UpdateEditInput();
+            ProcessWheel();
             UpdateRenderMode();
             if (_perWindowActive) UpdateWindowPoses();
             UpdateCanvasStereo();
@@ -4118,6 +4183,7 @@ namespace MonoXR.Client
         {
             if (_disposed) return;
             _disposed = true;
+            RemoveWheelHook();
             foreach (var rt in _targets) rt.Dispose();
             _targets.Clear();
             _whitePixel.Dispose();
