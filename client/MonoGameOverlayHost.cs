@@ -2779,6 +2779,7 @@ namespace MonoXR.Client
             UpdateCanvasStereo();
             UpdateToggleOverlay();
             UpdateCursorOverlay();
+            UpdateWorldOverlays();
 
             // Frame-rate cap: skip the whole frame if it is too soon. The
             // skipped time is not lost — the next processed frame's delta
@@ -3112,6 +3113,69 @@ namespace MonoXR.Client
         /// canvas plane. Runs on every RenderFrame call (not frame-capped) and
         /// only rewrites the pose, which the layer reads every VR frame.
         /// </summary>
+        // ----- World overlays ---------------------------------------------------
+        // Overlays that belong to a feature rather than to the canvas: each is its own OpenXR layer with a
+        // fixed picture, placed by the caller in the same world (LOCAL) space the canvas lives in - e.g.
+        // a marker standing on the road. They are published in RenderFrame like the cursor.
+
+        /// <summary>One overlay a caller owns (see <see cref="CreateWorldOverlay"/>).</summary>
+        public sealed class WorldOverlay : IDisposable
+        {
+            internal Overlay? Overlay;
+            internal byte[] Pixels = Array.Empty<byte>();
+            internal bool Published;
+
+            /// <summary>Centre of the quad, in the world space the canvas is placed in (meters).</summary>
+            public Vector3 Position;
+            /// <summary>Orientation: the quad faces its own +Z.</summary>
+            public Quaternion Rotation = Quaternion.Identity;
+            /// <summary>Width and height in meters.</summary>
+            public Vector2 Size = new(1f, 1f);
+            public bool Visible;
+
+            public void Dispose() { Overlay?.Dispose(); Overlay = null; }
+        }
+
+        private readonly List<WorldOverlay> _worldOverlays = new();
+
+        /// <summary>
+        /// A new overlay of its own showing <paramref name="rgba"/> (width x height, straight - not
+        /// premultiplied - alpha, row 0 at the top). Hidden until <see cref="WorldOverlay.Visible"/> is set.
+        /// Dispose it when done; at most 16 overlays exist in all.
+        /// </summary>
+        public WorldOverlay CreateWorldOverlay(int width, int height, byte[] rgba)
+        {
+            var w = new WorldOverlay { Pixels = rgba, Overlay = _mgr.CreateOverlay(width, height) };
+            w.Overlay.Space = MonoXrSpace.World;
+            w.Overlay.Visible = false;
+            _worldOverlays.Add(w);
+            return w;
+        }
+
+        public void RemoveWorldOverlay(WorldOverlay overlay)
+        {
+            _worldOverlays.Remove(overlay);
+            overlay.Dispose();
+        }
+
+        private void UpdateWorldOverlays()
+        {
+            foreach (var w in _worldOverlays)
+            {
+                var o = w.Overlay;
+                if (o == null) continue;
+                o.Space = MonoXrSpace.World;
+                o.Position = w.Position;
+                o.Rotation = w.Rotation;
+                o.Size = w.Size;
+                o.CurveRadius = 0f;
+                o.Visible = w.Visible;
+                if (!w.Visible) { o.UpdatePose(); continue; }
+                if (!w.Published) { o.Update(w.Pixels); w.Published = true; }
+                else o.UpdatePose();
+            }
+        }
+
         private void UpdateCursorOverlay()
         {
             if (!_appliedTriple && Curved != _appliedCurved) ApplyPose(); // the layer has just reported what the runtime can do
@@ -4184,6 +4248,8 @@ namespace MonoXR.Client
             if (_disposed) return;
             _disposed = true;
             RemoveWheelHook();
+            foreach (var w in _worldOverlays) w.Dispose();
+            _worldOverlays.Clear();
             foreach (var rt in _targets) rt.Dispose();
             _targets.Clear();
             _whitePixel.Dispose();
