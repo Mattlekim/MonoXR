@@ -395,9 +395,22 @@ static bool RenderSlot(SessionState& s, SlotResources& r, const MonoXrOverlaySlo
                 XrSwapchainImageWaitInfo wi{ XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
                 wi.timeout = XR_INFINITE_DURATION;
                 if (XR_SUCCEEDED(down_xrWaitSwapchainImage(r.swapchain, &wi))) {
-                    s.context->CopyResource(r.images[idx], r.sharedTex);
-                    r.lastFrameIndex = slot.frameIndex;
-                    r.hasContent = true;
+                    // CopyResource between textures of different size / format is invalid and can take the
+                    // game's device down. That happens for a moment when the client resizes its canvas (the
+                    // shared texture and the swapchain change at different frames), so check first and
+                    // simply skip the copy until they agree again.
+                    D3D11_TEXTURE2D_DESC sd{}, dd{};
+                    r.sharedTex->GetDesc(&sd);
+                    if (idx < r.images.size() && r.images[idx]) {
+                        r.images[idx]->GetDesc(&dd);
+                        if (sd.Width == dd.Width && sd.Height == dd.Height) {
+                            s.context->CopyResource(r.images[idx], r.sharedTex);
+                            r.lastFrameIndex = slot.frameIndex;
+                            r.hasContent = true;
+                        } else {
+                            LogLine("skip copy: shared %ux%u vs swapchain %ux%u", sd.Width, sd.Height, dd.Width, dd.Height);
+                        }
+                    }
                 }
                 XrSwapchainImageReleaseInfo ri{ XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
                 down_xrReleaseSwapchainImage(r.swapchain, &ri);
@@ -668,7 +681,34 @@ static void PublishEyeGaze(SessionState& s, XrTime displayTime) {
 // ---------------------------------------------------------------------------
 // Hooked entry points
 // ---------------------------------------------------------------------------
+// A slot is read straight out of memory another process writes. NaN / infinite values, a pose that is
+// not a unit quaternion or a non-positive size make the runtime fail xrEndFrame (some games do not
+// survive that), so such an overlay is left out of the frame instead.
+static bool SlotIsSane(const MonoXrOverlaySlot& slot) {
+    const float v[] = { slot.posX, slot.posY, slot.posZ, slot.quatX, slot.quatY, slot.quatZ, slot.quatW,
+                        slot.sizeX, slot.sizeY, slot.curveRadius };
+    for (float f : v) if (!std::isfinite(f)) return false;
+    if (slot.sizeX <= 0.0f || slot.sizeY <= 0.0f) return false;
+    if (slot.texWidth > 16384 || slot.texHeight > 16384) return false;
+    float n = slot.quatX * slot.quatX + slot.quatY * slot.quatY + slot.quatZ * slot.quatZ + slot.quatW * slot.quatW;
+    return n > 0.98f && n < 1.02f;
+}
+
+static XrResult MonoXr_xrEndFrameImpl(XrSession session, const XrFrameEndInfo* frameEndInfo);
+
+// Nothing may throw out of a hook into the game: an exception crossing the OpenXR boundary ends the
+// process. Fall back to the plain, unmodified frame.
 static XrResult XRAPI_CALL MonoXr_xrEndFrame(XrSession session, const XrFrameEndInfo* frameEndInfo) {
+    try {
+        return MonoXr_xrEndFrameImpl(session, frameEndInfo);
+    } catch (...) {
+        static bool logged = false;
+        if (!logged) { logged = true; LogLine("exception in xrEndFrame hook - passing the frame through"); }
+        return down_xrEndFrame(session, frameEndInfo);
+    }
+}
+
+static XrResult MonoXr_xrEndFrameImpl(XrSession session, const XrFrameEndInfo* frameEndInfo) {
     std::lock_guard<std::mutex> guard(g_lock);
     SessionState& s = g_session;
 
@@ -726,6 +766,7 @@ static XrResult XRAPI_CALL MonoXr_xrEndFrame(XrSession session, const XrFrameEnd
         }
         if (!(slot.visible & MONOXR_VISIBLE_SHOWN)) continue; // hidden but still owned: keep the swapchain for when it comes back
         if (slot.texWidth == 0 || slot.texHeight == 0) continue;
+        if (!SlotIsSane(slot)) continue; // garbage in the shared block must not reach the runtime
 
         XrSwapchainSubImage sub{};
         if (!RenderSlot(s, r, slot, sub)) continue;

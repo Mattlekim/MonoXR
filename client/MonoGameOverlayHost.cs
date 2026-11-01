@@ -1338,6 +1338,14 @@ namespace MonoXR.Client
         /// </summary>
         public Func<OverlayRenderTarget, bool>? GazeButtonState { get; set; }
 
+        /// <summary>
+        /// Optional, instead of the on/off <see cref="GazeButtonState"/> icon: what a target is tracked
+        /// with. 0 = off (eye struck through), 1 = eye tracking (eye), 2 = head tracking (head). The
+        /// button still needs <see cref="GazeButtonState"/> to appear; clicking still raises
+        /// <see cref="GazeToggleRequested"/> and the app decides what the next mode is.
+        /// </summary>
+        public Func<OverlayRenderTarget, int>? GazeButtonMode { get; set; }
+
         /// <summary>Raised when a target's edit-mode gaze (eye) button is clicked (see <see cref="GazeButtonState"/>).</summary>
         public event Action<OverlayRenderTarget>? GazeToggleRequested;
 
@@ -3001,7 +3009,7 @@ namespace MonoXR.Client
                     DrawEditButton(fainter, "-", false);
                     DrawOpacityButton(opacityReset, rt.Opacity);
                     DrawEditButton(stronger, "+", false);
-                    if (!gaze.IsEmpty && GazeButtonState != null) DrawGazeButton(gaze, GazeButtonState(rt));
+                    if (!gaze.IsEmpty && GazeButtonState != null) DrawGazeButton(gaze, GazeButtonMode != null ? GazeButtonMode(rt) : (GazeButtonState(rt) ? 1 : 0));
                     if (!bind.IsEmpty && BindButtonLabel != null)
                         DrawBindButton(bind, BindButtonLabel(rt).Active, GetBindButtonText(rt));
                     if (!show.IsEmpty && ShowChips != null)
@@ -3272,10 +3280,12 @@ namespace MonoXR.Client
         }
 
         /// <summary>Gaze button: an eye, lit while the target reacts to being looked at and struck through when it does not.</summary>
-        private void DrawGazeButton(XnaRectangle r, bool enabled)
+        private void DrawGazeButton(XnaRectangle r, int mode)
         {
+            bool enabled = mode != 0;
             var bg = DrawEditButtonFrame(r, enabled);
             int cx = r.X + r.Width / 2, cy = r.Y + r.Height / 2;
+            if (mode == 2) { DrawHeadIcon(cx, cy, bg); return; }
             const int halfW = 16, halfH = 9;
             for (int dx = -halfW; dx <= halfW; dx++)
             {
@@ -3303,6 +3313,22 @@ namespace MonoXR.Client
                 DrawLine(a, b, 7f, bg);
                 DrawLine(a, b, 3f, XnaColor.OrangeRed);
             }
+        }
+
+        /// <summary>Head-tracking icon: a head seen from the side, facing right, with a nose.</summary>
+        private void DrawHeadIcon(int cx, int cy, XnaColor bg)
+        {
+            const int radius = 10;
+            for (int y = -radius; y <= radius; y++)
+            {
+                int w = (int)MathF.Round(MathF.Sqrt(radius * radius - y * y));
+                _compositor.Draw(_whitePixel, new XnaRectangle(cx - 3 - w, cy + y, w * 2, 1), XnaColor.White);
+            }
+            // nose, pointing right
+            for (int i = 0; i < 6; i++)
+                _compositor.Draw(_whitePixel, new XnaRectangle(cx + 7 - 0, cy - 1 + i - 2, 6 - i, 1), XnaColor.White);
+            // eye
+            _compositor.Draw(_whitePixel, new XnaRectangle(cx + 1, cy - 4, 3, 3), bg);
         }
 
         /// <summary>Opacity button: a half-filled disc followed by the current percentage.</summary>
