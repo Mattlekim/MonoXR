@@ -107,6 +107,24 @@ namespace MonoXR.Client
 
         public override void OnPointerDrag(int x, int y) => _pointerCapture?.OnPointerDrag(x, y);
 
+        /// <summary>True when the pointer is over an item that takes the wheel (a slider).</summary>
+        public override bool WantsWheel(int x, int y)
+        {
+            LayoutItems();
+            foreach (var item in _items)
+                if (item.Bounds.Contains(x, y) && item.WantsWheel(x, y)) return true;
+            return false;
+        }
+
+        public override bool OnPointerWheel(int x, int y, int delta)
+        {
+            LayoutItems();
+            foreach (var item in _items)
+                if (item.Bounds.Contains(x, y) && item.WantsWheel(x, y))
+                    return item.OnPointerWheel(x, y, delta);
+            return false;
+        }
+
         public override void OnPointerRelease(int x, int y)
         {
             var cap = _pointerCapture;

@@ -85,6 +85,20 @@ namespace MonoXR.Client
             if (_dragging) SetFromPointer(x);
         }
 
+        // Anywhere on the row keeps the wheel (even a disabled one, so the turn does not fall through to
+        // a scrolling panel behind it); only an enabled slider changes.
+        public override bool WantsWheel(int x, int y) => Bounds.Contains(x, y);
+
+        public override bool OnPointerWheel(int x, int y, int delta)
+        {
+            if (!IsEnabled || !Bounds.Contains(x, y)) return false;
+            int notches = (int)Math.Round(delta / 120.0);
+            if (notches == 0) notches = delta > 0 ? 1 : -1;
+            float step = Step > 0 ? Step : (Maximum - Minimum) / 100f;
+            Value += step * notches;
+            return true;
+        }
+
         public override void OnPointerRelease(int x, int y) => _dragging = false;
 
         private void SetFromPointer(int x)

@@ -70,6 +70,15 @@ namespace MonoXR.Client
         /// </summary>
         public virtual bool OnPointerPress(int x, int y) => false;
 
+        /// <summary>
+        /// True while the pointer is over something here that uses the mouse wheel (a slider). The hosting
+        /// panel then keeps the wheel for it - it must not scroll the panel, or reach the game.
+        /// </summary>
+        public virtual bool WantsWheel(int x, int y) => false;
+
+        /// <summary>The wheel turned over this control; <paramref name="delta"/> is 120 per notch, positive = up. Returns true when used.</summary>
+        public virtual bool OnPointerWheel(int x, int y, int delta) => false;
+
         /// <summary>Pointer moved while captured via <see cref="OnPointerPress"/> (may be out of bounds).</summary>
         public virtual void OnPointerDrag(int x, int y)
         {
