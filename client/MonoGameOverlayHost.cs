@@ -1537,9 +1537,18 @@ namespace MonoXR.Client
 
         private static float SlackClamp(float mapped, float min, float max, ref float slack)
         {
+            // A NaN / infinite input (or slack) must never get as far as a position: (int)NaN is int.MinValue,
+            // which would throw the cross far off the canvas for good, and the slack would stay poisoned.
+            if (!float.IsFinite(slack)) slack = 0f;
+            if (!float.IsFinite(mapped)) return Math.Clamp(min + slack, min, max);
             float pos = mapped + slack;
             if (pos > max) { slack -= pos - max; pos = max; }
             else if (pos < min) { slack += min - pos; pos = min; }
+            // Overshoot is remembered so the pointer moves again the moment it turns round - but only up to
+            // one limit-width. Further out (the mouse is on another monitor) it would take as far again to
+            // come back, and the cross would sit stuck at the edge, looking gone.
+            float limit = Math.Max(1f, max - min);
+            slack = Math.Clamp(slack, -limit, limit);
             return pos;
         }
 
@@ -3312,8 +3321,52 @@ namespace MonoXR.Client
             }
         }
 
+        // The cursor's picture is published once and then only its pose is refreshed. If the game's layer
+        // restarts (a new session, a new game process) or ever misses it, the cross would stay gone for the
+        // rest of the run, so it is published again when the layer's process changes and every few seconds.
+        private uint _cursorLayerPid;
+        private TimeSpan _cursorRepublished = TimeSpan.Zero;
+        private static readonly TimeSpan CursorRepublishEvery = TimeSpan.FromSeconds(3);
+
+        /// <summary>One line describing the pointer / cursor state, for the log when the red cross goes missing.</summary>
+        public string CursorDebug
+        {
+            get
+            {
+                GetCursorPos(out var p);
+                string win = "no game window";
+                var hWnd = _gameWindow;
+                if (hWnd != IntPtr.Zero && GetClientRect(hWnd, out var rc))
+                {
+                    var q = p;
+                    ScreenToClient(hWnd, ref q);
+                    win = $"game window {rc.Right - rc.Left}x{rc.Bottom - rc.Top}, pointer in it ({q.X},{q.Y})";
+                }
+                return $"cursor canvas=({_cursorX},{_cursorY}) of {CanvasWidth}x{CanvasHeight}, screen=({p.X},{p.Y}) of " +
+                       $"{GetSystemMetrics(SM_CXSCREEN)}x{GetSystemMetrics(SM_CYSCREEN)}, {win}, " +
+                       $"slack win=({_windowSlackX:0},{_windowSlackY:0}) edge=({_edgeSlackX:0},{_edgeSlackY:0}), " +
+                       $"cal=({_calScaleX:0.###},{_calOffsetX:0.###},{_calScaleY:0.###},{_calOffsetY:0.###}) calStep={_calStep}, " +
+                       $"overlay visible={_cursorOverlay.Visible} published={_cursorPublished} canvasVisible={_overlay.Visible} " +
+                       $"layerPid={_mgr.LayerProcessId} attached={LayerAttached}";
+            }
+        }
+
         private void UpdateCursorOverlay()
         {
+            // Never let a bad position stand: back to the middle rather than somewhere off the canvas.
+            if (_cursorX < 0 || _cursorX >= CanvasWidth || _cursorY < 0 || _cursorY >= CanvasHeight)
+            {
+                _cursorX = CanvasWidth / 2; _cursorY = CanvasHeight / 2;
+                ResetOvershoot();
+            }
+            uint layerPid = _mgr.LayerProcessId;
+            if (layerPid != _cursorLayerPid) { _cursorLayerPid = layerPid; _cursorPublished = false; }
+            if (_inputClock.Elapsed - _cursorRepublished > CursorRepublishEvery)
+            {
+                _cursorRepublished = _inputClock.Elapsed;
+                _cursorPublished = false;
+            }
+
             if (!_appliedTriple && Curved != _appliedCurved) ApplyPose(); // the layer has just reported what the runtime can do
             var canvas = _overlay;
             _cursorOverlay.Space = canvas.Space;
