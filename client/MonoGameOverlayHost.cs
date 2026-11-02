@@ -1532,6 +1532,27 @@ namespace MonoXR.Client
         private void ResetCanvasOvershoot() =>
             _edgeSlackX = _edgeSlackY = _overrideSlackX = _overrideSlackY = _bandSlackX = 0f;
 
+        // Left and right button pressed together: forget the cross's accumulated offset from the pointer
+        // (the overshoot kept when the mouse leaves the game window or the canvas edge), so the cross
+        // lands exactly where the mouse maps to. The calibration is left alone.
+        private bool _resetChordDown;
+
+        /// <summary>Raised when the left + right click chord reset the cross's offset.</summary>
+        public event Action? CursorOffsetReset;
+
+        private void CheckOffsetResetChord()
+        {
+            bool left = LeftButtonOverride?.Invoke() ?? ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0);
+            bool both = left && PollRightButton();
+            if (both && !_resetChordDown)
+            {
+                ResetOvershoot();
+                PreviewVersion++;
+                CursorOffsetReset?.Invoke();
+            }
+            _resetChordDown = both;
+        }
+
         private void ResetOvershoot() =>
             _windowSlackX = _windowSlackY = _edgeSlackX = _edgeSlackY = _overrideSlackX = _overrideSlackY = _bandSlackX = 0f;
 
@@ -2911,6 +2932,7 @@ namespace MonoXR.Client
             // between samples on capped ticks). Changes just mark things
             // dirty; the actual render still happens at the capped rate.
             UpdateEditInput();
+            CheckOffsetResetChord();
             ProcessWheel();
             UpdateRenderMode();
             if (_perWindowActive) UpdateWindowPoses();
